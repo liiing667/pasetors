@@ -167,7 +167,14 @@ impl PublicToken {
         let sig = Signature::from_slice(s).map_err(|_| Error::TokenValidation)?;
 
         if pk.verify(m2, &sig).is_ok() {
-            TrustedToken::_new(Self::HEADER, m, f, i)
+            TrustedToken::_new(
+                Self::HEADER,
+                m,
+                f,
+                i,
+                #[cfg(feature = "serde")]
+                token.raw_token(),
+            )
         } else {
             Err(Error::TokenValidation)
         }
@@ -313,7 +320,14 @@ impl LocalToken {
         ctx.xor_keystream_into(&mut out)
             .map_err(|_| Error::TokenValidation)?;
 
-        TrustedToken::_new(Self::HEADER, &out, f, i)
+        TrustedToken::_new(
+            Self::HEADER,
+            &out,
+            f,
+            i,
+            #[cfg(feature = "serde")]
+            token.raw_token(),
+        )
     }
 }
 

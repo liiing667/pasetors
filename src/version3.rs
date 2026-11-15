@@ -222,7 +222,14 @@ impl PublicToken {
             .verify_prehash(&msg_digest, &s)
             .map_err(|_| Error::TokenValidation)?;
 
-        TrustedToken::_new(Self::HEADER, m, f, i)
+        TrustedToken::_new(
+            Self::HEADER,
+            m,
+            f,
+            i,
+            #[cfg(feature = "serde")]
+            token.raw_token(),
+        )
     }
 }
 

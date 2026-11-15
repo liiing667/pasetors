@@ -159,7 +159,14 @@ impl PublicToken {
         let sig = Signature::from_slice(s).map_err(|_| Error::TokenValidation)?;
 
         if pk.verify(m2, &sig).is_ok() {
-            TrustedToken::_new(Self::HEADER, m, f, &[])
+            TrustedToken::_new(
+                Self::HEADER,
+                m,
+                f,
+                &[],
+                #[cfg(feature = "serde")]
+                token.raw_token(),
+            )
         } else {
             Err(Error::TokenValidation)
         }
@@ -266,7 +273,14 @@ impl LocalToken {
             Some(pre_auth.as_ref()),
             &mut out,
         ) {
-            Ok(()) => TrustedToken::_new(Self::HEADER, &out, f, &[]),
+            Ok(()) => TrustedToken::_new(
+                Self::HEADER,
+                &out,
+                f,
+                &[],
+                #[cfg(feature = "serde")]
+                token.raw_token(),
+            ),
             Err(orion::errors::UnknownCryptoError) => Err(Error::TokenValidation),
         }
     }

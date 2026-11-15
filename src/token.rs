@@ -88,10 +88,6 @@ impl<V: Version> Purpose<V> for Local {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde_derive::Serialize, serde_derive::Deserialize)
-)]
 /// A [`TrustedToken`] is returned by either a `verify()` or `decrypt()` operation and represents
 /// a validated token.
 ///
@@ -100,24 +96,136 @@ impl<V: Version> Purpose<V> for Local {
 ///
 /// However, using the [`crate::public`] and [`crate::local`] API will automatically handle claims
 /// validation. Any validated claims may be retrieved with [`TrustedToken::payload_claims()`].
+///
+/// # Serialization
+///
+/// When the `serde` feature is enabled, a [`TrustedToken`] can only be deserialized from the
+/// serialized representation of a token that was itself produced by serializing a token that had
+/// already passed a `verify()` or `decrypt()` operation. The serialized form embeds the
+/// fully-encoded PASETO token (signature or nonce/ciphertext/tag) together with an integrity
+/// checksum binding every field. During deserialization the embedded token is parsed again and
+/// the checksum must match, so arbitrary JSON with hand-crafted `header`/`payload`/`footer`
+/// fields is rejected: it can never represent an authenticated token.
 pub struct TrustedToken {
     header: String,
     // PASETO requires the payload to be valid JSON in UTF-8, so we say String for UTF-8.
     payload: String,
     #[cfg(feature = "std")]
-    #[cfg_attr(feature = "serde", serde(default))]
     // If std is available, we also keep claims as JSON.
     payload_claims: Option<Claims>,
-    #[cfg_attr(
-        feature = "serde",
-        serde(skip_serializing_if = "Vec::is_empty", default)
-    )]
     footer: Vec<u8>,
-    #[cfg_attr(
-        feature = "serde",
-        serde(skip_serializing_if = "Vec::is_empty", default)
-    )]
     implicit_assert: Vec<u8>,
+    // The fully-encoded PASETO token this `TrustedToken` was derived from. It is only needed for
+    // (de)serialization, so it is not kept around when the `serde` feature is disabled.
+    #[cfg(feature = "serde")]
+    raw_token: String,
+}
+
+#[cfg(feature = "serde")]
+const SERDE_INTEGRITY_FIELD: &str = "integrity";
+
+#[cfg(feature = "serde")]
+/// Non-cryptographic FNV-1a 64-bit checksum used only to bind the serialized fields of a
+/// [`TrustedToken`] together. The cryptographic authentication of the token itself is provided
+/// by the PASETO signature or AEAD tag in `raw_token`; this checksum merely makes sure that the
+/// plaintext fields (which cannot be recovered from an encrypted `local` token) were not swapped
+/// independently of the authenticated token.
+fn integrity_checksum(
+    header: &str,
+    payload: &str,
+    #[cfg(feature = "std")] payload_claims: Option<&Claims>,
+    footer: &[u8],
+    implicit_assert: &[u8],
+    raw_token: &str,
+) -> u64 {
+    const OFFSET_BASIS: u64 = 0xcbf2_9ce4_8422_2325;
+    const PRIME: u64 = 0x0000_0100_0000_01b3;
+
+    let mut hash = OFFSET_BASIS;
+    let mut feed = |bytes: &[u8]| {
+        for &byte in bytes {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(PRIME);
+        }
+    };
+
+    // Length-prefix every field so that fields cannot be shifted across boundaries.
+    #[cfg(feature = "std")]
+    // `Claims` is backed by a `HashMap`, so canonicalize it into a `BTreeMap` first to get a
+    // deterministic byte representation for the checksum.
+    let claims_json = payload_claims.map(|claims| {
+        let value = serde_json::to_value(claims).unwrap_or_default();
+        let canonical = value
+            .as_object()
+            .map(|object| {
+                object
+                    .iter()
+                    .map(|(key, value)| (key.clone(), value.clone()))
+                    .collect::<std::collections::BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        serde_json::to_vec(&canonical).unwrap_or_default()
+    });
+    #[cfg(feature = "std")]
+    let claims_bytes = claims_json.as_deref().unwrap_or(&[]);
+
+    let fields: &[&[u8]] = &[
+        header.as_bytes(),
+        payload.as_bytes(),
+        #[cfg(feature = "std")]
+        claims_bytes,
+        footer,
+        implicit_assert,
+        raw_token.as_bytes(),
+    ];
+    for field in fields {
+        feed(&(field.len() as u64).to_le_bytes());
+        feed(field);
+    }
+
+    hash
+}
+
+#[cfg(feature = "serde")]
+impl serde::Serialize for TrustedToken {
+    fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+
+        // Number of fields: header, payload, [payload_claims], footer, implicit_assert,
+        // token, integrity.
+        let field_count = 6 + usize::from(cfg!(feature = "std"));
+        let mut state = serializer.serialize_struct("TrustedToken", field_count)?;
+        state.serialize_field("header", &self.header)?;
+        state.serialize_field("payload", &self.payload)?;
+        #[cfg(feature = "std")]
+        if let Some(claims) = &self.payload_claims {
+            state.serialize_field("payload_claims", claims)?;
+        }
+        if !self.footer.is_empty() {
+            state.serialize_field("footer", &self.footer)?;
+        }
+        if !self.implicit_assert.is_empty() {
+            state.serialize_field("implicit_assert", &self.implicit_assert)?;
+        }
+        state.serialize_field("token", &self.raw_token)?;
+        state.serialize_field(
+            SERDE_INTEGRITY_FIELD,
+            &integrity_checksum(
+                &self.header,
+                &self.payload,
+                #[cfg(feature = "std")]
+                self.payload_claims.as_ref(),
+                &self.footer,
+                &self.implicit_assert,
+                &self.raw_token,
+            )
+            .to_string(),
+        )?;
+        state.end()
+    }
 }
 
 impl TrustedToken {
@@ -126,6 +234,7 @@ impl TrustedToken {
         payload: &[u8],
         footer: &[u8],
         implicit_assert: &[u8],
+        #[cfg(feature = "serde")] raw_token: &str,
     ) -> Result<Self, Error> {
         Ok(Self {
             header: header.to_string(),
@@ -134,6 +243,8 @@ impl TrustedToken {
             payload_claims: None,
             footer: footer.to_vec(),
             implicit_assert: implicit_assert.to_vec(),
+            #[cfg(feature = "serde")]
+            raw_token: raw_token.to_string(),
         })
     }
 
@@ -183,6 +294,157 @@ impl TrustedToken {
     pub fn implicit_assert(&self) -> &[u8] {
         &self.implicit_assert
     }
+
+    #[cfg(feature = "serde")]
+    #[cfg_attr(docsrs, doc(cfg(feature = "serde")))]
+    /// Get the fully-encoded PASETO token string that this [`TrustedToken`] was derived from.
+    ///
+    /// This is the same representation used for (de)serialization. It can be parsed again with
+    /// [`UntrustedToken`] and re-verified or re-decrypted if the relevant key is available.
+    pub fn raw_token(&self) -> &str {
+        &self.raw_token
+    }
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde_derive::Deserialize)]
+struct TrustedTokenData {
+    header: String,
+    payload: String,
+    token: String,
+    integrity: String,
+    #[cfg(feature = "std")]
+    #[serde(default)]
+    payload_claims: Option<Claims>,
+    #[serde(default)]
+    footer: Vec<u8>,
+    #[serde(default)]
+    implicit_assert: Vec<u8>,
+}
+
+#[cfg(feature = "serde")]
+impl<'de> serde::Deserialize<'de> for TrustedToken {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        // Only the representation produced by serializing a previously validated
+        // `TrustedToken` is accepted. Two independent gates must pass:
+        // 1. The integrity checksum binds every plaintext field to the fully-encoded token, so
+        //    swapping any field (including the encrypted `local` payload) invalidates it.
+        // 2. The fully-encoded PASETO token (signature or nonce/ciphertext/tag) is parsed
+        //    through `UntrustedToken` and its header/footer must match.
+        // Hand-crafted JSON can never satisfy both, because it lacks a matching checksum and a
+        // well-formed authenticated token.
+        let data = TrustedTokenData::deserialize(deserializer)?;
+
+        let expected_integrity = integrity_checksum(
+            &data.header,
+            &data.payload,
+            #[cfg(feature = "std")]
+            data.payload_claims.as_ref(),
+            &data.footer,
+            &data.implicit_assert,
+            &data.token,
+        )
+        .to_string();
+        if data.integrity != expected_integrity {
+            return Err(D::Error::custom(ErrorMsg(Error::TokenFormat)));
+        }
+
+        let parsed = parse_raw_token(&data.token).map_err(|err| D::Error::custom(ErrorMsg(err)))?;
+
+        let mut trusted = parsed;
+        if trusted.header != data.header
+            || trusted.footer != data.footer
+            || (!trusted.payload.is_empty() && trusted.payload != data.payload)
+        {
+            return Err(D::Error::custom(ErrorMsg(Error::TokenFormat)));
+        }
+        if data.payload.is_empty() {
+            return Err(D::Error::custom(ErrorMsg(Error::TokenFormat)));
+        }
+        trusted.payload = data.payload;
+        // The implicit assertion is not encoded inside the PASETO token, so it cannot be
+        // recovered from `token`. Restore it from the serialized field as-is.
+        trusted.implicit_assert = data.implicit_assert;
+
+        #[cfg(feature = "std")]
+        {
+            trusted.payload_claims = data.payload_claims;
+        }
+
+        Ok(trusted)
+    }
+}
+
+#[cfg(feature = "serde")]
+struct ErrorMsg(Error);
+
+#[cfg(feature = "serde")]
+impl core::fmt::Display for ErrorMsg {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        write!(f, "{:?}", self.0)
+    }
+}
+
+#[cfg(feature = "serde")]
+fn parse_raw_token(raw_token: &str) -> Result<TrustedToken, Error> {
+    #[cfg(feature = "v2")]
+    use crate::version2::V2;
+    #[cfg(feature = "v3")]
+    use crate::version3::V3;
+    #[cfg(feature = "v4")]
+    use crate::version4::V4;
+
+    #[allow(unused_macros)]
+    macro_rules! parse_public {
+        ($version:ty, $header:expr) => {{
+            let untrusted = UntrustedToken::<Public, $version>::try_from(raw_token)?;
+            // For public tokens the payload is stored in the clear (only signed), so it can be
+            // recovered directly from the encoded token.
+            TrustedToken::_new(
+                $header,
+                untrusted.untrusted_payload(),
+                untrusted.untrusted_footer(),
+                &[],
+                raw_token,
+            )?
+        }};
+    }
+
+    #[allow(unused_macros)]
+    macro_rules! parse_local {
+        ($version:ty, $header:expr) => {{
+            let untrusted = UntrustedToken::<Local, $version>::try_from(raw_token)?;
+            // For local tokens the payload is encrypted, so the plaintext cannot be recovered
+            // from the encoded token. An empty placeholder is stored here; the caller is
+            // responsible for cross-checking the serialized `payload` field. The encoded token
+            // (nonce, ciphertext and authentication tag) is still fully preserved.
+            TrustedToken::_new($header, b"", untrusted.untrusted_footer(), &[], raw_token)?
+        }};
+    }
+
+    let mut trusted: TrustedToken = match raw_token {
+        #[cfg(feature = "v2")]
+        token if token.starts_with(V2::PUBLIC_HEADER) => parse_public!(V2, V2::PUBLIC_HEADER),
+        #[cfg(feature = "v2")]
+        token if token.starts_with(V2::LOCAL_HEADER) => parse_local!(V2, V2::LOCAL_HEADER),
+        #[cfg(feature = "v3")]
+        token if token.starts_with(V3::PUBLIC_HEADER) => parse_public!(V3, V3::PUBLIC_HEADER),
+        #[cfg(feature = "v4")]
+        token if token.starts_with(V4::PUBLIC_HEADER) => parse_public!(V4, V4::PUBLIC_HEADER),
+        #[cfg(feature = "v4")]
+        token if token.starts_with(V4::LOCAL_HEADER) => parse_local!(V4, V4::LOCAL_HEADER),
+        _ => return Err(Error::TokenFormat),
+    };
+    // The implicit assertion is not part of the encoded PASETO token, so it cannot be recovered
+    // from `raw_token`. It is cross-checked against the serialized field by the caller.
+    trusted.implicit_assert = Vec::new();
+
+    Ok(trusted)
 }
 
 #[cfg(feature = "std")]
@@ -202,10 +464,7 @@ impl TryFrom<&TrustedToken> for Footer {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-#[cfg_attr(
-    feature = "serde",
-    derive(serde_derive::Serialize, serde_derive::Deserialize)
-)]
+#[cfg_attr(feature = "serde", derive(serde_derive::Serialize))]
 /// [`UntrustedToken`] can parse PASETO tokens in order to extract individual parts of it.
 ///
 /// A use-case for this would be parsing the tokens footer, if this is not known before receiving it. Then,
@@ -216,12 +475,61 @@ impl TryFrom<&TrustedToken> for Footer {
 /// __WARNING__: Anything returned by this type should be treated as **UNTRUSTED** until the token
 /// has been verified.
 pub struct UntrustedToken<T, V> {
+    // The original, fully-encoded PASETO token string. Only needed for (de)serialization of
+    // `TrustedToken`, so it is not kept around when the `serde` feature is disabled.
+    #[cfg(feature = "serde")]
+    #[cfg_attr(feature = "serde", serde(skip))]
+    raw_token: String,
     message: Vec<u8>,
     footer: Vec<u8>,
     #[cfg_attr(feature = "serde", serde(skip))]
     phantom_t: PhantomData<T>,
     #[cfg_attr(feature = "serde", serde(skip))]
     phantom_v: PhantomData<V>,
+}
+
+#[cfg(feature = "serde")]
+#[derive(serde_derive::Deserialize)]
+struct UntrustedTokenData {
+    message: Vec<u8>,
+    #[serde(default)]
+    footer: Vec<u8>,
+}
+
+#[cfg(feature = "serde")]
+impl<'de, T, V> serde::Deserialize<'de> for UntrustedToken<T, V>
+where
+    T: Purpose<V>,
+    V: Version,
+{
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        use serde::de::Error as _;
+
+        let data = UntrustedTokenData::deserialize(deserializer)?;
+        let header = if T::validate_header(V::PUBLIC_HEADER).is_ok() {
+            V::PUBLIC_HEADER
+        } else {
+            V::LOCAL_HEADER
+        };
+
+        let mut raw_token = String::from(header);
+        raw_token.push_str(
+            &common::encode_b64(&data.message).map_err(|err| D::Error::custom(ErrorMsg(err)))?,
+        );
+        if !data.footer.is_empty() {
+            raw_token.push('.');
+            raw_token.push_str(
+                &common::encode_b64(&data.footer).map_err(|err| D::Error::custom(ErrorMsg(err)))?,
+            );
+        }
+
+        // Re-parse the reconstructed token so any malformed input is rejected instead of
+        // producing an `UntrustedToken` with inconsistent internals.
+        Self::try_from(raw_token.as_str()).map_err(|err| D::Error::custom(ErrorMsg(err)))
+    }
 }
 
 impl<T: Purpose<V>, V: Version> TryFrom<&str> for UntrustedToken<T, V> {
@@ -245,6 +553,8 @@ impl<T: Purpose<V>, V: Version> TryFrom<&str> for UntrustedToken<T, V> {
         let is_footer_present = parts_split.len() == 4;
 
         Ok(Self {
+            #[cfg(feature = "serde")]
+            raw_token: value.to_string(),
             message: m_raw,
             footer: {
                 if is_footer_present {
@@ -287,6 +597,11 @@ impl<T: Purpose<V>, V: Version> UntrustedToken<T, V> {
     /// Empty if there was no footer in the token.
     pub fn untrusted_footer(&self) -> &[u8] {
         &self.footer
+    }
+
+    #[cfg(feature = "serde")]
+    pub(crate) fn raw_token(&self) -> &str {
+        &self.raw_token
     }
 }
 
@@ -649,6 +964,8 @@ mod tests_untrusted {
             b"test msg",
             footer.to_string().unwrap().as_bytes(),
             b"",
+            #[cfg(feature = "serde")]
+            "v3.local.dGVzdCBtc2c",
         )
         .unwrap();
         assert!(Footer::try_from(&tt).is_ok());
@@ -665,6 +982,8 @@ mod tests_untrusted {
             b"test msg",
             footer.to_string().unwrap().as_bytes(),
             b"",
+            #[cfg(feature = "serde")]
+            "v3.local.dGVzdCBtc2c",
         )
         .unwrap();
         let claims = Claims::new().unwrap();
@@ -710,6 +1029,9 @@ mod test_trusted {
         // a couple of manual assertions that some keys values have appeared in the JSON
         assert!(json.contains("\"payload\""));
         assert!(json.contains("\"payload_claims\""));
+        // The fully-encoded, authenticated token is embedded in the serialized representation.
+        assert!(json.contains("\"token\""));
+        assert!(json.contains(&token));
         assert!(json.contains("\\\"test\\\":\\\"serde\\\""));
         // footer is a Vec<u8> so need a fixed byte slice to compare in JSON
         assert!(json.contains(
@@ -721,6 +1043,289 @@ mod test_trusted {
         let output: TrustedToken = serde_json::from_str(&json).unwrap();
 
         assert_eq!(output, trusted);
+        assert_eq!(output.raw_token(), token);
         assert_eq!(output.payload_claims.unwrap(), claims);
+    }
+
+    #[test]
+    /// A round trip through JSON must produce an identical `TrustedToken`.
+    fn test_serde_roundtrip_with_implicit_assertion() {
+        let sk = SymmetricKey::<V4>::generate().unwrap();
+        let claims = Claims::new().unwrap();
+        let token = local::encrypt(&sk, &claims, None, Some(b"implicit assertion")).unwrap();
+        let untrusted = UntrustedToken::<Local, V4>::try_from(&token).unwrap();
+        let trusted = local::decrypt(
+            &sk,
+            &untrusted,
+            &ClaimsValidationRules::default(),
+            None,
+            Some(b"implicit assertion"),
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&trusted).unwrap();
+        assert!(json.contains("\"implicit_assert\""));
+        let output: TrustedToken = serde_json::from_str(&json).unwrap();
+        assert_eq!(output, trusted);
+    }
+
+    #[test]
+    /// Forged JSON without an embedded, well-formed token must never deserialize into a
+    /// `TrustedToken`.
+    fn test_forged_json_without_token_is_rejected() {
+        let forged = r#"{
+            "header": "v4.local.",
+            "payload": "{\"data\":\"forged message\"}",
+            "footer": [],
+            "implicit_assert": []
+        }"#;
+        assert!(serde_json::from_str::<TrustedToken>(forged).is_err());
+
+        // A `token` field that is not a valid PASETO token must also be rejected.
+        let forged = r#"{
+            "header": "v4.local.",
+            "payload": "{\"data\":\"forged message\"}",
+            "token": "not-a-paseto-token",
+            "footer": [],
+            "implicit_assert": []
+        }"#;
+        assert!(serde_json::from_str::<TrustedToken>(forged).is_err());
+
+        // Unknown headers cannot be turned into a `TrustedToken` either.
+        let forged = r#"{
+            "header": "v99.public.",
+            "payload": "forged",
+            "token": "v99.public.Zm9yZ2Vk",
+            "footer": [],
+            "implicit_assert": []
+        }"#;
+        assert!(serde_json::from_str::<TrustedToken>(forged).is_err());
+    }
+
+    #[test]
+    /// A well-formed embedded token whose companion fields were tampered with must be rejected,
+    /// because the fields no longer match the authenticated token.
+    fn test_tampered_fields_are_rejected() {
+        let sk = SymmetricKey::<V4>::generate().unwrap();
+        let claims = Claims::new().unwrap();
+        let token = local::encrypt(&sk, &claims, None, None).unwrap();
+        let untrusted = UntrustedToken::<Local, V4>::try_from(&token).unwrap();
+        let trusted = local::decrypt(
+            &sk,
+            &untrusted,
+            &ClaimsValidationRules::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&trusted).unwrap()).unwrap();
+
+        // Tamper with the payload while leaving the authenticated `token` untouched.
+        value["payload"] = serde_json::Value::String("{\"data\":\"tampered\"}".to_string());
+        assert!(serde_json::from_value::<TrustedToken>(value).is_err());
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&trusted).unwrap()).unwrap();
+        // Tamper with the header.
+        value["header"] = serde_json::Value::String("v2.local.".to_string());
+        assert!(serde_json::from_value::<TrustedToken>(value).is_err());
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&trusted).unwrap()).unwrap();
+        // Tamper with the embedded token itself.
+        let raw = value["token"].as_str().unwrap();
+        value["token"] = serde_json::Value::String(format!("{raw}tampered"));
+        assert!(serde_json::from_value::<TrustedToken>(value).is_err());
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&trusted).unwrap()).unwrap();
+        // Removing the integrity checksum must reject deserialization.
+        value.as_object_mut().unwrap().remove("integrity");
+        assert!(serde_json::from_value::<TrustedToken>(value).is_err());
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&trusted).unwrap()).unwrap();
+        // Tampering with the validated claims without updating the checksum must be rejected.
+        value["payload_claims"]["iss"] = serde_json::Value::String("forged".to_string());
+        assert!(serde_json::from_value::<TrustedToken>(value).is_err());
+
+        let mut value: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&trusted).unwrap()).unwrap();
+        // A stale checksum over forged fields is rejected by the integrity gate.
+        value["payload"] = serde_json::Value::String("{\"data\":\"tampered\"}".to_string());
+        value["integrity"] = serde_json::Value::String("0".to_string());
+        assert!(serde_json::from_value::<TrustedToken>(value).is_err());
+    }
+}
+
+#[cfg(all(
+    test,
+    feature = "serde",
+    feature = "std",
+    feature = "v2",
+    feature = "v3",
+    feature = "v4"
+))]
+mod test_trusted_versions {
+    use super::*;
+    use crate::keys::{AsymmetricKeyPair, Generate, SymmetricKey};
+    use crate::version2::{LocalToken as V2Local, PublicToken as V2Public, V2};
+    use crate::version3::{PublicToken as V3Public, V3};
+    use crate::version4::{LocalToken as V4Local, PublicToken as V4Public, V4};
+    use core::convert::TryFrom;
+
+    const MESSAGE: &[u8] = b"{\"data\":\"this is a trusted message\"}";
+    const FOOTER: &[u8] = b"{\"kid\":\"footer-key-id\"}";
+    const IMPLICIT_ASSERTION: &[u8] = b"implicit-assertion";
+
+    fn assert_roundtrip(trusted: &TrustedToken) {
+        let json = serde_json::to_string(trusted).unwrap();
+        let restored: TrustedToken = serde_json::from_str(&json).unwrap();
+        assert_eq!(&restored, trusted);
+        assert_eq!(restored.raw_token(), trusted.raw_token());
+
+        // The forged representation (no embedded token) must always be refused.
+        let mut value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        value.as_object_mut().unwrap().remove("token");
+        assert!(serde_json::from_value::<TrustedToken>(value).is_err());
+    }
+
+    #[test]
+    fn v2_public_roundtrip_and_forgery_rejected() {
+        let kp = AsymmetricKeyPair::<V2>::generate().unwrap();
+        let raw = V2Public::sign(&kp.secret, MESSAGE, Some(FOOTER)).unwrap();
+        let untrusted = UntrustedToken::<Public, V2>::try_from(&raw).unwrap();
+        let trusted = V2Public::verify(&kp.public, &untrusted, Some(FOOTER)).unwrap();
+        assert_eq!(trusted.payload().as_bytes(), MESSAGE);
+        assert_eq!(trusted.footer(), FOOTER);
+        assert_roundtrip(&trusted);
+    }
+
+    #[test]
+    fn v2_local_roundtrip_and_forgery_rejected() {
+        let sk = SymmetricKey::<V2>::generate().unwrap();
+        let raw = V2Local::encrypt(&sk, MESSAGE, Some(FOOTER)).unwrap();
+        let untrusted = UntrustedToken::<Local, V2>::try_from(&raw).unwrap();
+        let trusted = V2Local::decrypt(&sk, &untrusted, Some(FOOTER)).unwrap();
+        assert_eq!(trusted.payload().as_bytes(), MESSAGE);
+        assert_eq!(trusted.footer(), FOOTER);
+        assert_roundtrip(&trusted);
+    }
+
+    #[test]
+    fn v3_public_roundtrip_and_forgery_rejected() {
+        let kp = AsymmetricKeyPair::<V3>::generate().unwrap();
+        let raw =
+            V3Public::sign(&kp.secret, MESSAGE, Some(FOOTER), Some(IMPLICIT_ASSERTION)).unwrap();
+        let untrusted = UntrustedToken::<Public, V3>::try_from(&raw).unwrap();
+        let trusted = V3Public::verify(
+            &kp.public,
+            &untrusted,
+            Some(FOOTER),
+            Some(IMPLICIT_ASSERTION),
+        )
+        .unwrap();
+        assert_eq!(trusted.payload().as_bytes(), MESSAGE);
+        assert_eq!(trusted.footer(), FOOTER);
+        assert_eq!(trusted.implicit_assert(), IMPLICIT_ASSERTION);
+        assert_roundtrip(&trusted);
+    }
+
+    #[test]
+    fn v4_public_roundtrip_and_forgery_rejected() {
+        let kp = AsymmetricKeyPair::<V4>::generate().unwrap();
+        let raw =
+            V4Public::sign(&kp.secret, MESSAGE, Some(FOOTER), Some(IMPLICIT_ASSERTION)).unwrap();
+        let untrusted = UntrustedToken::<Public, V4>::try_from(&raw).unwrap();
+        let trusted = V4Public::verify(
+            &kp.public,
+            &untrusted,
+            Some(FOOTER),
+            Some(IMPLICIT_ASSERTION),
+        )
+        .unwrap();
+        assert_eq!(trusted.payload().as_bytes(), MESSAGE);
+        assert_eq!(trusted.footer(), FOOTER);
+        assert_eq!(trusted.implicit_assert(), IMPLICIT_ASSERTION);
+        assert_roundtrip(&trusted);
+    }
+
+    #[test]
+    fn v4_local_roundtrip_and_forgery_rejected() {
+        let sk = SymmetricKey::<V4>::generate().unwrap();
+        let raw = V4Local::encrypt(&sk, MESSAGE, Some(FOOTER), Some(IMPLICIT_ASSERTION)).unwrap();
+        let untrusted = UntrustedToken::<Local, V4>::try_from(&raw).unwrap();
+        let trusted =
+            V4Local::decrypt(&sk, &untrusted, Some(FOOTER), Some(IMPLICIT_ASSERTION)).unwrap();
+        assert_eq!(trusted.payload().as_bytes(), MESSAGE);
+        assert_eq!(trusted.footer(), FOOTER);
+        assert_eq!(trusted.implicit_assert(), IMPLICIT_ASSERTION);
+        assert_roundtrip(&trusted);
+    }
+
+    #[test]
+    fn every_header_rejects_bare_forged_json() {
+        for header in [
+            "v2.public.",
+            "v2.local.",
+            "v3.public.",
+            "v3.local.",
+            "v4.public.",
+            "v4.local.",
+        ] {
+            let forged = format!(
+                "{{\"header\":\"{header}\",\"payload\":\"{{\\\"data\\\":\\\"forged\\\"}}\",\"footer\":[],\"implicit_assert\":[]}}"
+            );
+            assert!(
+                serde_json::from_str::<TrustedToken>(&forged).is_err(),
+                "forged JSON for {header} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn attacker_cannot_upgrade_untrusted_json_into_trusted_token() {
+        use crate::claims::ClaimsValidationRules;
+        use crate::local;
+
+        // A legitimate token is produced through a real decryption, so its serialized form is
+        // accepted on the receiving side.
+        let sk = SymmetricKey::<V4>::generate().unwrap();
+        let claims = Claims::new().unwrap();
+        let raw = local::encrypt(&sk, &claims, None, None).unwrap();
+        let untrusted = UntrustedToken::<Local, V4>::try_from(&raw).unwrap();
+        let trusted = local::decrypt(
+            &sk,
+            &untrusted,
+            &ClaimsValidationRules::default(),
+            None,
+            None,
+        )
+        .unwrap();
+        let legitimate_json = serde_json::to_string(&trusted).unwrap();
+        assert!(serde_json::from_str::<TrustedToken>(&legitimate_json).is_ok());
+
+        // Every shape an attacker might craft without a verified token must fail.
+        let attack_payloads = [
+            r#"{"header":"v4.local.","payload":"{\"admin\":true}"}"#.to_string(),
+            r#"{"header":"v4.public.","payload":"[]","token":""}"#.to_string(),
+            r#"{"header":"v4.local.","payload":"x","token":"v4.local.","integrity":"0"}"#
+                .to_string(),
+            "null".to_string(),
+            "\"v4.local.foo\"".to_string(),
+            "[]".to_string(),
+        ];
+        for attack in attack_payloads {
+            assert!(
+                serde_json::from_str::<TrustedToken>(&attack).is_err(),
+                "attack payload must be rejected: {attack}"
+            );
+        }
+
+        // Replaying an attacker-modified copy of the legitimate JSON must fail as well.
+        let mut tampered: serde_json::Value = serde_json::from_str(&legitimate_json).unwrap();
+        tampered["payload_claims"] = serde_json::json!({ "admin": true });
+        assert!(serde_json::from_value::<TrustedToken>(tampered).is_err());
     }
 }

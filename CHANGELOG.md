@@ -1,3 +1,13 @@
+### Unreleased
+
+- (SECURITY) Harden `serde` support for `TrustedToken`. Previously any JSON with hand-crafted
+  `header`/`payload`/`footer` fields could be deserialized directly into a `TrustedToken`,
+  bypassing `verify()`/`decrypt()`. Deserialization now only accepts the representation produced
+  by serializing a token that already passed verification/decryption: the fully-encoded PASETO
+  token (with signature or nonce/ciphertext/tag) is embedded and re-parsed, every field is
+  cross-checked against it, and an integrity checksum binds all fields together. Forged or
+  tampered JSON is rejected with an error.
+
 ### 0.8.1
 
 __Date:__ August 30, 2026.
