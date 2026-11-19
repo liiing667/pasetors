@@ -23,6 +23,21 @@ impl Claims {
     pub const REGISTERED_CLAIMS: [&'static str; 7] =
         ["iss", "sub", "aud", "exp", "nbf", "iat", "jti"];
 
+    /// See [PASETO docs] for the reason behind this limit.
+    ///
+    /// Maximum nesting depth of the JSON claims document. Matches the
+    /// recursion limit of the underlying JSON parser.
+    ///
+    /// [PASETO docs]: https://github.com/paseto-standard/paseto-spec/blob/master/docs/02-Implementation-Guide/01-Payload-Processing.md#enforcing-maximum-depth-without-parsing-the-json-string
+    pub const MAX_RECURSION_DEPTH: usize = 128;
+
+    /// See [PASETO docs] for the reason behind this limit.
+    ///
+    /// Maximum total number of named members within the JSON claims document.
+    ///
+    /// [PASETO docs]: https://github.com/paseto-standard/paseto-spec/blob/master/docs/02-Implementation-Guide/01-Payload-Processing.md#enforcing-maximum-depth-without-parsing-the-json-string
+    pub const MAX_KEYS: usize = 512;
+
     /// Create a new `Claims` instance, setting:
     /// - `iat`, `nbf` to current UTC time
     /// - `exp` to one hour
@@ -220,6 +235,9 @@ impl Claims {
     /// - `bytes` contains non-UTF-8 sequences
     /// - `bytes` does not decode as valid JSON
     /// - `bytes` top-most JSON object does not decode to a map
+    /// - any JSON object contains the same member name more than once ([`Error::JsonDuplicateMember`])
+    /// - the JSON document is nested more than [`Self::MAX_RECURSION_DEPTH`] layers deep ([`Error::JsonDepthExceeded`])
+    /// - the JSON document contains more than [`Self::MAX_KEYS`] members ([`Error::JsonTooManyMembers`])
     /// - if any registered claims exist and they are not a `String`
     /// - if `exp`, `nbf` or `iat` exist and they cannot be parsed as `DateTime`
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
@@ -233,11 +251,15 @@ impl Claims {
     /// Errors:
     /// - `string` does not decode as valid JSON
     /// - `string` top-most JSON object does not decode to a map
+    /// - any JSON object contains the same member name more than once ([`Error::JsonDuplicateMember`])
+    /// - the JSON document is nested more than [`Self::MAX_RECURSION_DEPTH`] layers deep ([`Error::JsonDepthExceeded`])
+    /// - the JSON document contains more than [`Self::MAX_KEYS`] members ([`Error::JsonTooManyMembers`])
     /// - if any registered claims exist and they are not a `String`
     /// - if `exp`, `nbf` or `iat` exist and they cannot be parsed as `DateTime`
     pub fn from_string(string: &str) -> Result<Self, Error> {
         let list_of: HashMap<String, Value> =
-            serde_json::from_str(string).map_err(|_| Error::ClaimInvalidJson)?;
+            crate::json::parse_object(string, Self::MAX_RECURSION_DEPTH, Self::MAX_KEYS)
+                .map_err(|err| err.into_error(Error::ClaimInvalidJson))?;
 
         // Validate any possible registered claims for their type
         for registered_claim in Self::REGISTERED_CLAIMS {
@@ -1092,5 +1114,68 @@ mod test {
                 .unwrap_err(),
             Error::ClaimValidation(ClaimValidationError::NoStrNbf)
         );
+    }
+
+    #[test]
+    fn test_err_on_duplicate_member() {
+        // "First wins" vs. "last wins" disagreement across JSON implementations
+        // must never become a trusted result.
+        assert_eq!(
+            Claims::from_string(r#"{"aud":"audit-log","aud":"attacker"}"#).unwrap_err(),
+            Error::JsonDuplicateMember
+        );
+        // Nested duplicates are rejected as well.
+        assert_eq!(
+            Claims::from_string(r#"{"data":{"sub":"alice","sub":"mallory"}}"#).unwrap_err(),
+            Error::JsonDuplicateMember
+        );
+        // Keys that decode to the same string also count as duplicates.
+        assert_eq!(
+            Claims::from_string("{\"sub\":\"a\",\"\\u0073ub\":\"b\"}").unwrap_err(),
+            Error::JsonDuplicateMember
+        );
+    }
+
+    #[test]
+    fn test_err_on_too_deep() {
+        let json = format!("{}{}{}", "{\"a\":".repeat(200), "1", "}".repeat(200));
+        assert_eq!(
+            Claims::from_string(&json).unwrap_err(),
+            Error::JsonDepthExceeded
+        );
+    }
+
+    #[test]
+    fn test_err_on_too_many_members() {
+        let json = format!(
+            "{{{}}}",
+            (0..=Claims::MAX_KEYS)
+                .map(|n| format!("\"k{n}\":{n}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(
+            Claims::from_string(&json).unwrap_err(),
+            Error::JsonTooManyMembers
+        );
+    }
+
+    #[test]
+    fn test_multilingual_round_trip() {
+        let mut claims = Claims::new().unwrap();
+        claims.add_additional("言語", "日本語").unwrap();
+        claims.add_additional("issuer_name", "Jürgen ☃").unwrap();
+        claims.add_additional("emoji", "🦀").unwrap();
+        claims.add_additional("arabic", "مرحبا").unwrap();
+        claims
+            .add_additional(
+                "nested",
+                serde_json::json!({"中文": "值", "list": [1, "二", 3.0]}),
+            )
+            .unwrap();
+
+        let serialized = claims.to_string().unwrap();
+        let parsed = Claims::from_string(&serialized).unwrap();
+        assert_eq!(parsed, claims);
     }
 }

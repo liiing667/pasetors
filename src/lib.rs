@@ -216,6 +216,9 @@ pub mod claims;
 /// Footer for tokens.
 pub mod footer;
 
+#[cfg(feature = "std")]
+mod json;
+
 /// Keys used for PASETO tokens.
 pub mod keys;
 

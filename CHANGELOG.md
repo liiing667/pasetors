@@ -1,3 +1,10 @@
+### Unreleased
+
+- (BREAKING) Enforce single-value member semantics when parsing claims and footer JSON after cryptographic verification: duplicate object member names are now rejected instead of "last one wins", removing ambiguity between JSON implementations that take the first vs. the last value.
+- Add `Error::JsonDuplicateMember`, `Error::JsonDepthExceeded` and `Error::JsonTooManyMembers` as distinct rejection evidence for duplicate members, excessive nesting depth and excessive member counts in claims/footer JSON.
+- Limit claims JSON to a maximum nesting depth of 128 (`Claims::MAX_RECURSION_DEPTH`) and a maximum of 512 object members (`Claims::MAX_KEYS`), matching the limits already enforced for footers.
+- Remove `regex` from dependencies.
+
 ### 0.8.1
 
 __Date:__ August 30, 2026.

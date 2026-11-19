@@ -3,7 +3,6 @@
 use crate::errors::Error;
 #[cfg(feature = "paserk")]
 use crate::paserk::{FormatAsPaserk, Id};
-use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -129,9 +128,10 @@ impl Footer {
     /// - `bytes` contains non-UTF-8 sequences
     /// - `bytes` does not decode as valid JSON
     /// - `bytes` top-most JSON object does not decode to a map
+    /// - any JSON object contains the same member name more than once ([`Error::JsonDuplicateMember`])
     /// - if any registered claims exist and they are not a `String`
-    /// - Parsing JSON maps and arrays that are more than 128 layers deep
-    /// - Maximum number of named keys is exceeded
+    /// - the JSON document is nested more than [`Self::MAX_RECURSION_DEPTH`] layers deep ([`Error::JsonDepthExceeded`])
+    /// - Maximum number of named keys is exceeded ([`Error::JsonTooManyMembers`])
     /// - Maximum JSON-encoded string length is exceeded
     pub fn parse_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
         let input = bytes.to_vec();
@@ -144,19 +144,18 @@ impl Footer {
     /// Errors:
     /// - `string` does not decode as valid JSON
     /// - `string` top-most JSON object does not decode to a map
+    /// - any JSON object contains the same member name more than once ([`Error::JsonDuplicateMember`])
     /// - if any registered claims exist and they are not a `String`
-    /// - Parsing JSON maps and arrays that are more than 128 layers deep
-    /// - Maximum number of named keys is exceeded
+    /// - the JSON document is nested more than [`Self::MAX_RECURSION_DEPTH`] layers deep ([`Error::JsonDepthExceeded`])
+    /// - Maximum number of named keys is exceeded ([`Error::JsonTooManyMembers`])
     /// - Maximum JSON-encoded string length is exceeded
     pub fn parse_string(&mut self, string: &str) -> Result<(), Error> {
         if string.len() > self.max_len {
             return Err(Error::FooterParsing);
         }
-        if Regex::new(r#"[^\\]":"#).unwrap().find_iter(string).count() > self.max_keys {
-            return Err(Error::FooterParsing);
-        }
 
-        self.list_of = serde_json::from_str(string).map_err(|_| Error::FooterParsing)?;
+        self.list_of = crate::json::parse_object(string, Self::MAX_RECURSION_DEPTH, self.max_keys)
+            .map_err(|err| err.into_error(Error::FooterParsing))?;
 
         Ok(())
     }
@@ -175,28 +174,8 @@ impl Footer {
 
 #[cfg(test)]
 mod tests {
+    use crate::errors::Error;
     use crate::footer::Footer;
-    use regex::Regex;
-
-    #[test]
-    fn test_count_keys() {
-        // https://www.rustescaper.com/
-        let string = r#""name": "3-S-2",
-      "expect-fail": false,
-      "public-key": "02fbcb7c69ee1c60579be7a334134878d9c5c5bf35d552dab63c0140397ed14cef637d7720925c44699ea30e72874c72fb",
-      "secret-key": "20347609607477aca8fbfbc5e6218455f3199669792ef8b466faa87bdc67798144c848dd03661eed5ac62461340cea96",
-      "secret-key-pem": "-----BEGIN EC PRIVATE KEY-----nMIGkAgEBBDAgNHYJYHR3rKj7+8XmIYRV8xmWaXku+LRm+qh73Gd5gUTISN0DZh7tnWsYkYTQM6pagBwYFK4EEACKhZANiAAT7y3xp7hxgV5vnozQTSHjZxcW/NdVS2rY8nAUA5ftFM72N9dyCSXERpnqMOcodMcvt8kgcrB8KcKee0HU23E79/s4CvEs8hBfnjnSUd/gcAm08EjSIz06iWjrNy4NakxR3I=n-----END EC PRIVATE KEY-----",
-      "public-key-pem": "-----BEGIN PUBLIC KEY-----nMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE+8t8ae4cYFeb56M0E0h42cXFvzXVUtq2nPAFAOX7RTO9jfXcgklxEaZ6jDnKHTHL7fJIHKwfCnCnntB1NtxO/f7OArxLPIQX5n40lHf4HAJtPBI0iM9Oolo6zcuDWpMUdyn-----END PUBLIC KEY-----",
-      "token": "v3.public.eyJkYXRhIjoidGhpcyBpcyBhIHNpZ25lZCBtZXNzYWdlIiwiZXhwIjoiMjAyMi0wMS0wMVQwMDowMDowMCswMDowMCJ9ZWrbGZ6L0MDK72skosUaS0Dz7wJ_2bMcM6tOxFuCasO9GhwHrvvchqgXQNLQQyWzGC2wkr-VKII71AvkLpC8tJOrzJV1cap9NRwoFzbcXjzMZyxQ0wkshxZxx8ImmNWP.eyJraWQiOiJkWWtJU3lseFFlZWNFY0hFTGZ6Rjg4VVpyd2JMb2xOaUNkcHpVSEd3OVVxbiJ9",
-      "payload": "{"data":"this is a signed message","exp":"2022-01-01T00:00:00+00:00"}",
-      "footer": "{"kid":"dYkISylxQeecEcHELfzF88UZrwbLolNiCdpzUHGw9Uqn"}",
-      "implicit-assertion": """#;
-
-        assert_eq!(
-            Regex::new(r#"[^\\]":"#).unwrap().find_iter(string).count(),
-            13
-        );
-    }
 
     #[test]
     fn err_on_max_keys() {
@@ -209,11 +188,55 @@ mod tests {
 
         let mut footer_parse = Footer::default();
         footer_parse.max_keys(10);
-        assert!(
+        assert_eq!(
             footer_parse
                 .parse_bytes(footer.to_string().unwrap().as_bytes())
-                .is_err()
+                .unwrap_err(),
+            Error::JsonTooManyMembers
         );
+    }
+
+    #[test]
+    fn err_on_duplicate_member() {
+        let mut footer = Footer::default();
+        assert_eq!(
+            footer
+                .parse_string(r#"{"kid":"k1","kid":"k2"}"#)
+                .unwrap_err(),
+            Error::JsonDuplicateMember
+        );
+        // Nested duplicates are rejected as well.
+        let mut footer = Footer::default();
+        assert_eq!(
+            footer
+                .parse_string(r#"{"meta":{"kid":"k1","kid":"k2"}}"#)
+                .unwrap_err(),
+            Error::JsonDuplicateMember
+        );
+    }
+
+    #[test]
+    fn err_on_too_deep() {
+        let json = format!("{}{}{}", "{\"a\":".repeat(200), "1", "}".repeat(200));
+        let mut footer = Footer::default();
+        footer.max_len(json.len() + 1);
+        assert_eq!(
+            footer.parse_string(&json).unwrap_err(),
+            Error::JsonDepthExceeded
+        );
+    }
+
+    #[test]
+    fn multilingual_round_trip() {
+        let mut footer = Footer::default();
+        footer.add_additional("言語", "日本語").unwrap();
+        footer.add_additional("emoji", "🦀☃").unwrap();
+        footer.add_additional("arabic", "مرحبا").unwrap();
+
+        let serialized = footer.to_string().unwrap();
+        let mut parsed = Footer::default();
+        parsed.parse_string(&serialized).unwrap();
+        assert_eq!(parsed, footer);
     }
 
     #[test]

@@ -724,3 +724,102 @@ mod test_trusted {
         assert_eq!(output.payload_claims.unwrap(), claims);
     }
 }
+
+#[cfg(all(test, feature = "std", feature = "v4"))]
+mod test_strict_json_after_verification {
+    use super::*;
+    use crate::claims::ClaimsValidationRules;
+    use crate::keys::{AsymmetricKeyPair, Generate, SymmetricKey};
+    use crate::version4::{LocalToken, PublicToken, V4};
+    use crate::{local, public};
+
+    /// A cryptographically valid token whose payload contains conflicting
+    /// duplicate members must never become a [`TrustedToken`]: other JSON
+    /// implementations disagree on whether the first or last value wins.
+    #[test]
+    fn conflicting_claims_rejected_after_verify() {
+        let kp = AsymmetricKeyPair::<V4>::generate().unwrap();
+        // `aud` appears twice: an audit service reading the first value and a
+        // business service reading the last would see different identities.
+        let payload = br#"{"aud":"audit-log","aud":"attacker","exp":"2099-01-01T00:00:00+00:00"}"#;
+        let token = PublicToken::sign(&kp.secret, payload, None, None).unwrap();
+        let untrusted = UntrustedToken::<Public, V4>::try_from(&token).unwrap();
+
+        assert_eq!(
+            public::verify(
+                &kp.public,
+                &untrusted,
+                &ClaimsValidationRules::default(),
+                None,
+                None
+            )
+            .unwrap_err(),
+            Error::JsonDuplicateMember
+        );
+    }
+
+    #[test]
+    fn conflicting_claims_rejected_after_decrypt() {
+        let sk = SymmetricKey::<V4>::generate().unwrap();
+        let payload = br#"{"data":{"sub":"alice","sub":"mallory"}}"#;
+        let token = LocalToken::encrypt(&sk, payload, None, None).unwrap();
+        let untrusted = UntrustedToken::<Local, V4>::try_from(&token).unwrap();
+
+        assert_eq!(
+            local::decrypt(
+                &sk,
+                &untrusted,
+                &ClaimsValidationRules::default(),
+                None,
+                None
+            )
+            .unwrap_err(),
+            Error::JsonDuplicateMember
+        );
+    }
+
+    #[test]
+    fn conflicting_footer_rejected_after_verify() {
+        let kp = AsymmetricKeyPair::<V4>::generate().unwrap();
+        let payload = Claims::new().unwrap().to_string().unwrap();
+        let footer = br#"{"kid":"key-a","kid":"key-b"}"#;
+        let token = PublicToken::sign(&kp.secret, payload.as_bytes(), Some(footer), None).unwrap();
+        let untrusted = UntrustedToken::<Public, V4>::try_from(&token).unwrap();
+        let trusted = public::verify(
+            &kp.public,
+            &untrusted,
+            &ClaimsValidationRules::default(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(
+            Footer::try_from(&trusted).unwrap_err(),
+            Error::JsonDuplicateMember
+        );
+    }
+
+    #[test]
+    fn multilingual_claims_round_trip_after_verify() {
+        let kp = AsymmetricKeyPair::<V4>::generate().unwrap();
+        let mut claims = Claims::new().unwrap();
+        claims.add_additional("言語", "日本語").unwrap();
+        claims.add_additional("name", "Jürgen ☃").unwrap();
+        claims.add_additional("emoji", "🦀").unwrap();
+        claims.add_additional("arabic", "مرحبا").unwrap();
+
+        let token = public::sign(&kp.secret, &claims, None, None).unwrap();
+        let untrusted = UntrustedToken::<Public, V4>::try_from(&token).unwrap();
+        let trusted = public::verify(
+            &kp.public,
+            &untrusted,
+            &ClaimsValidationRules::default(),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(trusted.payload_claims().unwrap(), &claims);
+    }
+}

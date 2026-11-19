@@ -37,6 +37,16 @@ pub enum Error {
     PayloadInvalidUtf8,
     /// Error during parsing of a `Footer`.
     FooterParsing,
+    /// A JSON payload or footer contained a duplicate object member name.
+    ///
+    /// Rejected to enforce single-value member semantics: other JSON
+    /// implementations disagree on whether the first or last value wins,
+    /// so ambiguous documents must not become trusted results.
+    JsonDuplicateMember,
+    /// A JSON payload or footer exceeded the maximum nesting depth.
+    JsonDepthExceeded,
+    /// A JSON payload or footer exceeded the maximum number of object members.
+    JsonTooManyMembers,
 }
 
 #[derive(Debug, PartialEq, Eq)]
