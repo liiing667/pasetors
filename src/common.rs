@@ -49,6 +49,53 @@ pub(crate) fn validate_footer_untrusted_token<T: Purpose<V>, V: Version>(
     Ok(())
 }
 
+/// If the token footer contains a `kid` claim holding a PASERK ID, that ID must
+/// match `expected_id`, which is derived from the key actually used to verify or
+/// decrypt the token.
+///
+/// A PASERK ID binds the PASETO version (`k2`/`k3`/`k4`), the purpose-specific
+/// type (`lid` for `local` keys, `pid` for `public` keys) and the key material
+/// itself into a single identity. Requiring equality with the ID of the key in
+/// use therefore fails closed whenever the footer claims a key identity that
+/// conflicts with the token's version, its `local`/`public` purpose or the
+/// actual key - even when the same raw key bytes are valid for several of those
+/// combinations (e.g. Ed25519 keys shared between `v2` and `v4`).
+///
+/// Footers without a `kid` claim, or with a `kid` that is not a PASERK ID,
+/// carry no PASERK key identity and are not affected by this check.
+#[cfg(all(feature = "paserk", feature = "std"))]
+pub(crate) fn validate_footer_key_id<T: Purpose<V>, V: Version>(
+    token: &UntrustedToken<T, V>,
+    expected_id: &crate::paserk::Id,
+) -> Result<(), Error> {
+    use crate::paserk::Id;
+    use core::convert::TryFrom;
+
+    let footer = token.untrusted_footer();
+    if footer.is_empty() {
+        return Ok(());
+    }
+
+    let parsed: serde_json::Value = match serde_json::from_slice(footer) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(()),
+    };
+    let kid = match parsed.get("kid").and_then(|value| value.as_str()) {
+        Some(kid) => kid,
+        None => return Ok(()),
+    };
+    let id = match Id::try_from(kid) {
+        Ok(id) => id,
+        Err(_) => return Ok(()),
+    };
+
+    if &id != expected_id {
+        return Err(Error::TokenValidation);
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 pub(crate) mod tests {
     use alloc::string::String;

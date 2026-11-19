@@ -1,3 +1,7 @@
+### Unreleased
+
+- Security: When a token footer contains a `kid` claim holding a PASERK ID, `verify()`/`decrypt()` (including the high-level `public`/`local` APIs) now require that ID to match the PASERK ID of the key actually used. This binds the PASETO version, the `local`/`public` purpose, the PASERK ID type (`lid`/`pid`) and the key material into a single authorization identity and fails closed (`Error::TokenValidation`) on any conflict - e.g. the same PASERK identity written into footers of different versions, or a `public`-token key identity presented to the `local` trust domain. Footers without a PASERK ID `kid` are unaffected.
+
 ### 0.8.1
 
 __Date:__ August 30, 2026.

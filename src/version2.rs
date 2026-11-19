@@ -1,6 +1,8 @@
 #![cfg_attr(docsrs, doc(cfg(feature = "v2")))]
 
 use crate::common::{encode_b64, validate_footer_untrusted_token};
+#[cfg(all(feature = "paserk", feature = "std"))]
+use crate::common::validate_footer_key_id;
 use crate::errors::Error;
 use crate::keys::{
     AsymmetricKeyPair, AsymmetricPublicKey, AsymmetricSecretKey, Generate, SymmetricKey,
@@ -145,6 +147,8 @@ impl PublicToken {
         footer: Option<&[u8]>,
     ) -> Result<TrustedToken, Error> {
         validate_footer_untrusted_token(token, footer)?;
+        #[cfg(all(feature = "paserk", feature = "std"))]
+        validate_footer_key_id(token, &crate::paserk::Id::from(public_key))?;
 
         let f = token.untrusted_footer();
         let sm = token.untrusted_message();
@@ -245,6 +249,8 @@ impl LocalToken {
         footer: Option<&[u8]>,
     ) -> Result<TrustedToken, Error> {
         validate_footer_untrusted_token(token, footer)?;
+        #[cfg(all(feature = "paserk", feature = "std"))]
+        validate_footer_key_id(token, &crate::paserk::Id::from(secret_key))?;
 
         let f = token.untrusted_footer();
         let nc = token.untrusted_message();
