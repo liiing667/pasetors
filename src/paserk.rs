@@ -421,6 +421,14 @@ impl TryFrom<&str> for Id {
             return Err(Error::PaserkParsing);
         }
 
+        let decoded = decode_b64(split[2]).map_err(|_| Error::PaserkParsing)?;
+        if decoded.len() != expected_len / 4 * 3 {
+            return Err(Error::PaserkParsing);
+        }
+        if encode_b64(&decoded).map_err(|_| Error::PaserkParsing)? != split[2] {
+            return Err(Error::PaserkParsing);
+        }
+
         Ok(Self {
             header,
             identifier: split[2].to_string(),
@@ -972,6 +980,61 @@ mod tests {
         );
         assert_eq!(
             Id::try_from("k4.pid.toosmall").unwrap_err(),
+            Error::PaserkParsing
+        );
+
+        // Correct length but invalid base64url characters.
+        for header in ["k2.lid.", "k3.sid.", "k4.pid."] {
+            for bad_char in ['!', '=', '+', '/', ' ', '.'] {
+                let mut bad = String::from(header);
+                bad.push_str(&"A".repeat(43));
+                bad.push(bad_char);
+                assert_eq!(
+                    Id::try_from(bad.as_str()).unwrap_err(),
+                    Error::PaserkParsing
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(feature = "v2", feature = "v3", feature = "v4"))]
+    fn test_id_unique_identity() {
+        use crate::keys::{AsymmetricKeyPair, Generate};
+
+        let skv2 = SymmetricKey::<V2>::generate().unwrap();
+        let skv4 = SymmetricKey::<V4>::generate().unwrap();
+        let kpv2 = AsymmetricKeyPair::<V2>::generate().unwrap();
+        let kpv3 = AsymmetricKeyPair::<V3>::generate().unwrap();
+        let kpv4 = AsymmetricKeyPair::<V4>::generate().unwrap();
+
+        // A canonical ID string parses back to the identity computed from the key.
+        for id in [
+            Id::from(&skv2),
+            Id::from(&skv4),
+            Id::from(&kpv2.secret),
+            Id::from(&kpv2.public),
+            Id::from(&kpv3.secret),
+            Id::from(&kpv3.public),
+            Id::from(&kpv4.secret),
+            Id::from(&kpv4.public),
+        ] {
+            let mut buf = String::new();
+            id.fmt(&mut buf).unwrap();
+            assert_eq!(Id::try_from(buf.as_str()).unwrap(), id);
+        }
+
+        // The same identifier under a different key type is a different identity.
+        let mut lid = String::new();
+        Id::from(&skv4).fmt(&mut lid).unwrap();
+        let sid = lid.replacen("k4.lid.", "k4.sid.", 1);
+        assert_ne!(Id::try_from(sid.as_str()).unwrap(), Id::from(&skv4));
+
+        // Non-ID PASERK types cannot be used as an ID.
+        let mut local = String::new();
+        skv4.fmt(&mut local).unwrap();
+        assert_eq!(
+            Id::try_from(local.as_str()).unwrap_err(),
             Error::PaserkParsing
         );
     }
