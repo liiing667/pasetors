@@ -57,10 +57,6 @@ optional = true
 version = "2.6.1"
 default-features = false
 
-[dependencies.regex]
-version = "1.5.5"
-optional = true
-
 [dependencies.p384]
 version = "0.14.0"
 features = [ "getrandom" ]
@@ -81,7 +77,7 @@ optional = true
 [features]
 default = ["std", "v4", "paserk"]
 serde = ["dep:serde", "dep:serde_derive"]
-std = ["serde_json", "time", "regex"]
+std = ["serde_json", "time"]
 v2 = ["orion", "ed25519-compact"]
 v3 = ["p384", "sha2"]
 v4 = ["orion", "ed25519-compact"]

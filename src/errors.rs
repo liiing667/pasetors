@@ -37,6 +37,9 @@ pub enum Error {
     PayloadInvalidUtf8,
     /// Error during parsing of a `Footer`.
     FooterParsing,
+    /// A pre-parse resource limit (byte length, member count or nesting depth)
+    /// was exceeded before any untrusted JSON could be constructed into an object.
+    LimitExceeded,
 }
 
 #[derive(Debug, PartialEq, Eq)]

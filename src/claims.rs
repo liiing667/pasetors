@@ -1,6 +1,8 @@
 #![cfg_attr(docsrs, doc(cfg(feature = "std")))]
 
 use crate::errors::{ClaimValidationError, Error};
+use crate::footer::Footer;
+use crate::json_policy::JsonPolicy;
 use core::convert::TryFrom;
 use serde_json::Value;
 use std::collections::HashMap;
@@ -22,6 +24,17 @@ impl Claims {
     /// Keys for registered claims, that are reserved for usage by PASETO in top-level.
     pub const REGISTERED_CLAIMS: [&'static str; 7] =
         ["iss", "sub", "aud", "exp", "nbf", "iat", "jti"];
+
+    /// Pre-parse resource budget shared with [`Footer`]. Claims cannot be
+    /// configured individually, so both token payloads and footers are bounded
+    /// by the same byte-length, member-count and nesting-depth policy.
+    fn policy() -> JsonPolicy {
+        JsonPolicy::new(
+            Footer::DEFAULT_MAX_LEN,
+            Footer::DEFAULT_MAX_KEYS,
+            Footer::MAX_RECURSION_DEPTH,
+        )
+    }
 
     /// Create a new `Claims` instance, setting:
     /// - `iat`, `nbf` to current UTC time
@@ -220,12 +233,16 @@ impl Claims {
     /// - `bytes` contains non-UTF-8 sequences
     /// - `bytes` does not decode as valid JSON
     /// - `bytes` top-most JSON object does not decode to a map
+    /// - the pre-parse byte-length, member-count or nesting-depth budget is exceeded
     /// - if any registered claims exist and they are not a `String`
     /// - if `exp`, `nbf` or `iat` exist and they cannot be parsed as `DateTime`
     pub fn from_bytes(bytes: &[u8]) -> Result<Self, Error> {
-        let input = bytes.to_vec();
+        Self::policy()
+            .enforce(bytes)
+            .map_err(|_| Error::ClaimInvalidJson)?;
 
-        Self::from_string(&String::from_utf8(input).map_err(|_| Error::ClaimInvalidUtf8)?)
+        let input = String::from_utf8(bytes.to_vec()).map_err(|_| Error::ClaimInvalidUtf8)?;
+        Self::parse_checked(&input)
     }
 
     /// Attempt to create `Claims` from a string.
@@ -233,9 +250,19 @@ impl Claims {
     /// Errors:
     /// - `string` does not decode as valid JSON
     /// - `string` top-most JSON object does not decode to a map
+    /// - the pre-parse byte-length, member-count or nesting-depth budget is exceeded
     /// - if any registered claims exist and they are not a `String`
     /// - if `exp`, `nbf` or `iat` exist and they cannot be parsed as `DateTime`
     pub fn from_string(string: &str) -> Result<Self, Error> {
+        Self::policy()
+            .enforce(string.as_bytes())
+            .map_err(|_| Error::ClaimInvalidJson)?;
+
+        Self::parse_checked(string)
+    }
+
+    /// Parse an input whose pre-parse budget has already been enforced.
+    fn parse_checked(string: &str) -> Result<Self, Error> {
         let list_of: HashMap<String, Value> =
             serde_json::from_str(string).map_err(|_| Error::ClaimInvalidJson)?;
 
@@ -1047,6 +1074,63 @@ mod test {
             Claims::from_string(&claimsstring).unwrap_err(),
             Error::InvalidClaim
         );
+    }
+
+    #[test]
+    fn test_claims_enforce_same_budgets_as_footer() {
+        // Byte-length budget (default 8192) is exceeded before parsing.
+        let oversized = format!("{{\"a\":\"{}\"}}", "x".repeat(8192));
+        assert_eq!(
+            Claims::from_string(&oversized).unwrap_err(),
+            Error::ClaimInvalidJson
+        );
+        assert_eq!(
+            Claims::from_bytes(oversized.as_bytes()).unwrap_err(),
+            Error::ClaimInvalidJson
+        );
+
+        // Member-count budget (default 512) is exceeded before parsing.
+        let many_keys = (0..513)
+            .map(|idx| format!("\"k{idx}\":1"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let many_keys = format!("{{{many_keys}}}");
+        assert!(many_keys.len() <= Footer::DEFAULT_MAX_LEN);
+        assert_eq!(
+            Claims::from_string(&many_keys).unwrap_err(),
+            Error::ClaimInvalidJson
+        );
+
+        // Nesting-depth budget (default 128) is exceeded before parsing.
+        let deeply_nested = format!("{}{}{}", "[".repeat(128), "1", "]".repeat(128));
+        assert_eq!(
+            Claims::from_string(&deeply_nested).unwrap_err(),
+            Error::ClaimInvalidJson
+        );
+    }
+
+    #[test]
+    fn test_claims_embedded_json_strings_count_once() {
+        // Escaped members inside a string value must not count towards the
+        // 512-member budget, even though a whole-document regex would count them.
+        let embedded_pairs = (0..600)
+            .map(|idx| format!("\\\"k{idx}\\\":1"))
+            .collect::<Vec<_>>()
+            .join(",");
+        let input = format!("{{\"data\":\"{{{embedded_pairs}}}\"}}");
+        assert!(input.len() <= Footer::DEFAULT_MAX_LEN);
+
+        assert!(Claims::from_string(&input).is_ok());
+    }
+
+    #[test]
+    fn test_claims_within_budget_still_parse() {
+        let mut claims = Claims::new().unwrap();
+        claims.add_additional("data", "value").unwrap();
+        let serialized = claims.to_string().unwrap();
+
+        assert_eq!(Claims::from_string(&serialized).unwrap(), claims);
+        assert_eq!(Claims::from_bytes(serialized.as_bytes()).unwrap(), claims);
     }
 
     #[test]

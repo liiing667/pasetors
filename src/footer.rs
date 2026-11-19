@@ -1,9 +1,9 @@
 #![cfg_attr(docsrs, doc(cfg(feature = "std")))]
 
 use crate::errors::Error;
+use crate::json_policy::JsonPolicy;
 #[cfg(feature = "paserk")]
 use crate::paserk::{FormatAsPaserk, Id};
-use regex::Regex;
 use serde_json::Value;
 use std::collections::HashMap;
 
@@ -13,6 +13,7 @@ pub struct Footer {
     list_of: HashMap<String, Value>,
     max_keys: usize,
     max_len: usize,
+    max_depth: usize,
 }
 
 impl Default for Footer {
@@ -53,7 +54,9 @@ impl Footer {
 
     /// See [PASETO docs] for the reason behind this limit.
     ///
-    /// This value has been set by `serde_json` and cannot be changed.
+    /// This matches the recursion limit used internally by `serde_json`. It is
+    /// used as the default depth budget and can be changed with
+    /// [`Self::max_depth`].
     ///
     /// [PASETO docs]: https://github.com/paseto-standard/paseto-spec/blob/master/docs/02-Implementation-Guide/01-Payload-Processing.md#enforcing-maximum-depth-without-parsing-the-json-string
     pub const MAX_RECURSION_DEPTH: usize = 128;
@@ -64,7 +67,13 @@ impl Footer {
             list_of: HashMap::new(),
             max_keys: Self::DEFAULT_MAX_KEYS,
             max_len: Self::DEFAULT_MAX_LEN,
+            max_depth: Self::MAX_RECURSION_DEPTH,
         }
+    }
+
+    /// The unified pre-parse budget derived from the currently configured limits.
+    fn policy(&self) -> JsonPolicy {
+        JsonPolicy::new(self.max_len, self.max_keys, self.max_depth)
     }
 
     /// Change the default (512) amount of maximum number of named keys within an object.
@@ -79,6 +88,16 @@ impl Footer {
     /// __NOTE__: There should be no need to change this if you don't know this is a specific problem for you.
     pub fn max_len(&mut self, max_len: usize) {
         self.max_len = max_len;
+    }
+
+    /// Change the default (128) maximum nesting depth of JSON maps and arrays.
+    ///
+    /// The depth is measured on the raw input before parsing, so inputs exceeding
+    /// it are rejected before any JSON value is constructed.
+    ///
+    /// __NOTE__: There should be no need to change this if you don't know this is a specific problem for you.
+    pub fn max_depth(&mut self, max_depth: usize) {
+        self.max_depth = max_depth;
     }
 
     /// Add additional claims. If `claim` already exists, it is replaced with the new.
@@ -130,13 +149,18 @@ impl Footer {
     /// - `bytes` does not decode as valid JSON
     /// - `bytes` top-most JSON object does not decode to a map
     /// - if any registered claims exist and they are not a `String`
-    /// - Parsing JSON maps and arrays that are more than 128 layers deep
-    /// - Maximum number of named keys is exceeded
-    /// - Maximum JSON-encoded string length is exceeded
+    /// - a pre-parse resource limit is exceeded ([`Error::LimitExceeded`]):
+    ///   JSON-encoded length, number of named keys or nesting depth (128 by default)
     pub fn parse_bytes(&mut self, bytes: &[u8]) -> Result<(), Error> {
-        let input = bytes.to_vec();
+        // All resource limits are enforced on the raw bytes first, so the
+        // length, member and depth budgets are applied before UTF-8 decoding
+        // and before any JSON parsing takes place.
+        self.policy().enforce(bytes)?;
 
-        self.parse_string(&String::from_utf8(input).map_err(|_| Error::FooterParsing)?)
+        let input = String::from_utf8(bytes.to_vec()).map_err(|_| Error::FooterParsing)?;
+        self.list_of = serde_json::from_str(&input).map_err(|_| Error::FooterParsing)?;
+
+        Ok(())
     }
 
     /// Attempt to parse a `Footer` from a string.
@@ -145,16 +169,10 @@ impl Footer {
     /// - `string` does not decode as valid JSON
     /// - `string` top-most JSON object does not decode to a map
     /// - if any registered claims exist and they are not a `String`
-    /// - Parsing JSON maps and arrays that are more than 128 layers deep
-    /// - Maximum number of named keys is exceeded
-    /// - Maximum JSON-encoded string length is exceeded
+    /// - a pre-parse resource limit is exceeded ([`Error::LimitExceeded`]):
+    ///   JSON-encoded length, number of named keys or nesting depth (128 by default)
     pub fn parse_string(&mut self, string: &str) -> Result<(), Error> {
-        if string.len() > self.max_len {
-            return Err(Error::FooterParsing);
-        }
-        if Regex::new(r#"[^\\]":"#).unwrap().find_iter(string).count() > self.max_keys {
-            return Err(Error::FooterParsing);
-        }
+        self.policy().enforce(string.as_bytes())?;
 
         self.list_of = serde_json::from_str(string).map_err(|_| Error::FooterParsing)?;
 
@@ -176,27 +194,6 @@ impl Footer {
 #[cfg(test)]
 mod tests {
     use crate::footer::Footer;
-    use regex::Regex;
-
-    #[test]
-    fn test_count_keys() {
-        // https://www.rustescaper.com/
-        let string = r#""name": "3-S-2",
-      "expect-fail": false,
-      "public-key": "02fbcb7c69ee1c60579be7a334134878d9c5c5bf35d552dab63c0140397ed14cef637d7720925c44699ea30e72874c72fb",
-      "secret-key": "20347609607477aca8fbfbc5e6218455f3199669792ef8b466faa87bdc67798144c848dd03661eed5ac62461340cea96",
-      "secret-key-pem": "-----BEGIN EC PRIVATE KEY-----nMIGkAgEBBDAgNHYJYHR3rKj7+8XmIYRV8xmWaXku+LRm+qh73Gd5gUTISN0DZh7tnWsYkYTQM6pagBwYFK4EEACKhZANiAAT7y3xp7hxgV5vnozQTSHjZxcW/NdVS2rY8nAUA5ftFM72N9dyCSXERpnqMOcodMcvt8kgcrB8KcKee0HU23E79/s4CvEs8hBfnjnSUd/gcAm08EjSIz06iWjrNy4NakxR3I=n-----END EC PRIVATE KEY-----",
-      "public-key-pem": "-----BEGIN PUBLIC KEY-----nMHYwEAYHKoZIzj0CAQYFK4EEACIDYgAE+8t8ae4cYFeb56M0E0h42cXFvzXVUtq2nPAFAOX7RTO9jfXcgklxEaZ6jDnKHTHL7fJIHKwfCnCnntB1NtxO/f7OArxLPIQX5n40lHf4HAJtPBI0iM9Oolo6zcuDWpMUdyn-----END PUBLIC KEY-----",
-      "token": "v3.public.eyJkYXRhIjoidGhpcyBpcyBhIHNpZ25lZCBtZXNzYWdlIiwiZXhwIjoiMjAyMi0wMS0wMVQwMDowMDowMCswMDowMCJ9ZWrbGZ6L0MDK72skosUaS0Dz7wJ_2bMcM6tOxFuCasO9GhwHrvvchqgXQNLQQyWzGC2wkr-VKII71AvkLpC8tJOrzJV1cap9NRwoFzbcXjzMZyxQ0wkshxZxx8ImmNWP.eyJraWQiOiJkWWtJU3lseFFlZWNFY0hFTGZ6Rjg4VVpyd2JMb2xOaUNkcHpVSEd3OVVxbiJ9",
-      "payload": "{"data":"this is a signed message","exp":"2022-01-01T00:00:00+00:00"}",
-      "footer": "{"kid":"dYkISylxQeecEcHELfzF88UZrwbLolNiCdpzUHGw9Uqn"}",
-      "implicit-assertion": """#;
-
-        assert_eq!(
-            Regex::new(r#"[^\\]":"#).unwrap().find_iter(string).count(),
-            13
-        );
-    }
 
     #[test]
     fn err_on_max_keys() {
@@ -394,5 +391,127 @@ mod tests {
         footer.key_id(&paserk_id);
         assert!(footer.contains_claim("kid"));
         assert_eq!(footer.get_claim("kid").unwrap().as_str().unwrap(), buf);
+    }
+
+    #[test]
+    fn err_on_max_depth() {
+        let mut footer = Footer::new();
+        footer.max_depth(3);
+
+        // Four nested containers exceed the configured depth of three.
+        let too_deep = r#"{"a":[{"b":1}]}"#;
+        assert_eq!(
+            footer.parse_bytes(too_deep.as_bytes()),
+            Err(crate::errors::Error::LimitExceeded)
+        );
+
+        // Exactly at the limit still parses.
+        let at_limit = r#"{"a":{"b":1}}"#;
+        assert!(footer.parse_bytes(at_limit.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn default_depth_budget_rejects_parser_stack_abuse() {
+        // serde_json itself gives up at a depth of 128. The policy must reject
+        // such input before the recursive parser is ever reached.
+        let deeply_nested = format!("{}{}{}", "[".repeat(128), "1", "]".repeat(128));
+
+        let mut footer = Footer::new();
+        assert_eq!(
+            footer.parse_bytes(deeply_nested.as_bytes()),
+            Err(crate::errors::Error::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn embedded_json_strings_cannot_inflate_key_count() {
+        // The escaped `":` sequences are string content. A regex scanning the
+        // whole document would count them as keys; the policy must not.
+        let embedded = r#"{"payload":"{\"k1\":1,\"k2\":2,\"k3\":3,\"k4\":4}"}"#;
+
+        let mut strict_footer = Footer::new();
+        strict_footer.max_keys(1);
+        assert!(strict_footer.parse_bytes(embedded.as_bytes()).is_ok());
+        assert!(strict_footer.contains_claim("payload"));
+
+        // Two genuine top-level members still exceed a one-key budget.
+        let two_real_keys = r#"{"payload":"x","other":"y"}"#;
+        let mut strict_footer = Footer::new();
+        strict_footer.max_keys(1);
+        assert_eq!(
+            strict_footer.parse_bytes(two_real_keys.as_bytes()),
+            Err(crate::errors::Error::LimitExceeded)
+        );
+    }
+
+    #[test]
+    fn braces_hidden_in_strings_do_not_affect_depth() {
+        let input = r#"{"a":"[[[[{{{","b":"still a value"}"#;
+
+        let mut footer = Footer::new();
+        footer.max_depth(2);
+        assert!(footer.parse_bytes(input.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn limit_violations_stop_before_object_construction() {
+        let oversized = r#"{"a":"this is longer than the configured budget"}"#;
+        let too_many = r#"{"a":1,"b":2,"c":3}"#;
+        let too_deep = r#"{"a":[{"b":1}]}"#;
+
+        let mut length_limited = Footer::new();
+        length_limited.max_len(10);
+        assert_eq!(
+            length_limited.parse_bytes(oversized.as_bytes()),
+            Err(crate::errors::Error::LimitExceeded)
+        );
+
+        let mut key_limited = Footer::new();
+        key_limited.max_keys(2);
+        assert_eq!(
+            key_limited.parse_bytes(too_many.as_bytes()),
+            Err(crate::errors::Error::LimitExceeded)
+        );
+
+        let mut depth_limited = Footer::new();
+        depth_limited.max_depth(3);
+        assert_eq!(
+            depth_limited.parse_bytes(too_deep.as_bytes()),
+            Err(crate::errors::Error::LimitExceeded)
+        );
+
+        // No untrusted member survives a rejected parse.
+        for footer in [length_limited, key_limited, depth_limited] {
+            assert!(!footer.contains_claim("a"));
+            assert_eq!(footer.to_string().unwrap(), "{}");
+        }
+    }
+
+    #[test]
+    fn valid_footer_within_custom_budgets_round_trips() {
+        let mut builder = Footer::new();
+        builder.add_additional("custom", "value").unwrap();
+        let serialized = builder.to_string().unwrap();
+
+        let mut parser = Footer::new();
+        parser.max_len(serialized.len());
+        parser.max_keys(1);
+        parser.max_depth(2);
+
+        assert!(parser.parse_bytes(serialized.as_bytes()).is_ok());
+        assert_eq!(parser.to_string().unwrap(), serialized);
+        assert_eq!(parser.get_claim("custom").unwrap(), "value");
+    }
+
+    #[test]
+    fn invalid_utf8_is_rejected_without_touching_the_parser() {
+        // Length/depth/key checks run on raw bytes first; this input is within
+        // every budget but is not valid UTF-8, so it must fail as a parsing
+        // error rather than producing a footer.
+        let mut footer = Footer::new();
+        assert_eq!(
+            footer.parse_bytes(&[b'{', 0xff, b'}']),
+            Err(crate::errors::Error::FooterParsing)
+        );
     }
 }

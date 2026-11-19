@@ -16,6 +16,12 @@ fuzz_target!(|data: &[u8]| {
     let mut footer = Footer::new();
     if let Ok(()) = footer.parse_bytes(data) {
         assert!(footer.to_string().is_ok());
+        // Everything that is parsed must fit the default pre-parse budgets, so
+        // a successful parse can never have exceeded the byte, member or depth
+        // limits enforced before construction.
+        assert!(data.len() <= Footer::DEFAULT_MAX_LEN);
+        let serialized = footer.to_string().unwrap();
+        assert!(serialized.len() <= Footer::DEFAULT_MAX_LEN);
     }
 
     let message: String = String::from_utf8_lossy(data).into();

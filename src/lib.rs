@@ -216,6 +216,10 @@ pub mod claims;
 /// Footer for tokens.
 pub mod footer;
 
+#[cfg(feature = "std")]
+/// Unified pre-parse resource limits for untrusted JSON.
+mod json_policy;
+
 /// Keys used for PASETO tokens.
 pub mod keys;
 

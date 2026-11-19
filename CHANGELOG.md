@@ -1,3 +1,10 @@
+### Unreleased
+
+- (BREAKING) `Footer::parse_bytes()`/`parse_string()` and `Claims::from_bytes()`/`from_string()` now enforce a unified pre-parse resource policy (byte length, object-member count and nesting depth) on the raw input before any JSON is constructed. Inputs exceeding a budget fail with `Error::LimitExceeded` for footers and `Error::ClaimInvalidJson` for claims.
+- Replace the whole-document regex used for footer key counting with a single linear, string-aware scan, so escaped `":`, braces and nested objects inside string values can no longer inflate the key/depth counters or evade the limits.
+- Add `Footer::max_depth()` for configuring the nesting-depth budget, alongside the existing `max_keys()` and `max_len()`.
+- Remove the `regex` dependency.
+
 ### 0.8.1
 
 __Date:__ August 30, 2026.
