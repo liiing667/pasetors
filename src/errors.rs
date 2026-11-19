@@ -37,6 +37,13 @@ pub enum Error {
     PayloadInvalidUtf8,
     /// Error during parsing of a `Footer`.
     FooterParsing,
+    /// Error for supplying an empty implicit assertion when a context binding was requested.
+    ///
+    /// An empty implicit assertion is cryptographically indistinguishable from having no
+    /// implicit assertion at all, so callers that want to bind a token to protocol context
+    /// must supply non-empty material. Tokens which intentionally have no binding must use
+    /// [`crate::token::ImplicitAssertion::Unbound`] explicitly.
+    EmptyImplicitAssertion,
 }
 
 #[derive(Debug, PartialEq, Eq)]

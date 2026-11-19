@@ -21,7 +21,7 @@ use crate::common::{encode_b64, validate_footer_untrusted_token};
 use crate::errors::Error;
 use crate::keys::{AsymmetricKeyPair, AsymmetricPublicKey, AsymmetricSecretKey, Generate};
 use crate::pae;
-use crate::token::{Public, TrustedToken, UntrustedToken};
+use crate::token::{ImplicitAssertion, Public, TrustedToken, UntrustedToken};
 use crate::version::private::Version;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -160,17 +160,18 @@ impl PublicToken {
         secret_key: &AsymmetricSecretKey<V3>,
         message: &[u8],
         footer: Option<&[u8]>,
-        implicit_assert: Option<&[u8]>,
+        implicit_assert: &ImplicitAssertion,
     ) -> Result<String, Error> {
         if message.is_empty() {
             return Err(Error::EmptyPayload);
         }
+        implicit_assert.validate()?;
 
         let signing_key = SigningKey::try_from(secret_key.as_bytes()).map_err(|_| Error::Key)?;
         let public_key = VerifyingKey::from(&signing_key).to_sec1_point(true);
 
         let f = footer.unwrap_or(&[]);
-        let i = implicit_assert.unwrap_or(&[]);
+        let i = implicit_assert.as_bytes();
         let m2 = pae::pae(&[public_key.as_ref(), Self::HEADER.as_bytes(), message, f, i])?;
 
         let msg_digest = sha2::Sha384::digest(&m2);
@@ -197,16 +198,22 @@ impl PublicToken {
     ///
     /// If `footer.is_none()`, then it will be validated but not compared to a known value.
     /// If `footer.is_some()`, then it will be validated AND compared to the known value.
+    ///
+    /// `implicit_assert` is an explicit protocol-context choice, see
+    /// [`ImplicitAssertion`]. A token bound to context material can only be verified when the
+    /// same material is supplied, while [`ImplicitAssertion::Unbound`] must be selected
+    /// deliberately to accept tokens without a binding.
     pub fn verify(
         public_key: &AsymmetricPublicKey<V3>,
         token: &UntrustedToken<Public, V3>,
         footer: Option<&[u8]>,
-        implicit_assert: Option<&[u8]>,
+        implicit_assert: &ImplicitAssertion,
     ) -> Result<TrustedToken, Error> {
         validate_footer_untrusted_token(token, footer)?;
+        implicit_assert.validate()?;
 
         let f = token.untrusted_footer();
-        let i = implicit_assert.unwrap_or(&[]);
+        let i = implicit_assert.as_bytes();
         let sm = token.untrusted_message();
         let m = token.untrusted_payload();
         let s = Signature::try_from(sm[m.len()..m.len() + V3::PUBLIC_SIG].as_ref())
@@ -222,7 +229,7 @@ impl PublicToken {
             .verify_prehash(&msg_digest, &s)
             .map_err(|_| Error::TokenValidation)?;
 
-        TrustedToken::_new(Self::HEADER, m, f, i)
+        TrustedToken::_new(Self::HEADER, m, f, implicit_assert)
     }
 }
 
@@ -305,7 +312,9 @@ mod test_regression {
         let sk = AsymmetricSecretKey::<V3>::from(&TEST_SK_BYTES).unwrap();
         for i in 0..64 {
             let message = format!("{}{}", "normalize s on sign", i);
-            let token = PublicToken::sign(&sk, message.as_bytes(), None, None).unwrap();
+            let token =
+                PublicToken::sign(&sk, message.as_bytes(), None, &ImplicitAssertion::Unbound)
+                    .unwrap();
             let ut = UntrustedToken::<Public, V3>::try_from(&token).unwrap();
             let sm = ut.untrusted_message();
             let m = ut.untrusted_payload();
@@ -353,10 +362,24 @@ mod test_vectors {
         let message = "this is a signed message";
 
         let token = UntrustedToken::<Public, V3>::try_from(
-            &PublicToken::sign(&sk, message.as_bytes(), Some(b"footer"), Some(b"impl")).unwrap(),
+            &PublicToken::sign(
+                &sk,
+                message.as_bytes(),
+                Some(b"footer"),
+                &ImplicitAssertion::bound(b"impl").unwrap(),
+            )
+            .unwrap(),
         )
         .unwrap();
-        assert!(PublicToken::verify(&pk, &token, Some(b"footer"), Some(b"impl")).is_ok());
+        assert!(
+            PublicToken::verify(
+                &pk,
+                &token,
+                Some(b"footer"),
+                &ImplicitAssertion::bound(b"impl").unwrap()
+            )
+            .is_ok()
+        );
     }
 
     fn test_public(test: &PasetoTest) {
@@ -380,11 +403,13 @@ mod test_vectors {
             Some(test.footer.as_bytes())
         };
         let implicit_assert = test.implicit_assertion.as_bytes();
+        let binding =
+            ImplicitAssertion::bound(implicit_assert).unwrap_or(ImplicitAssertion::Unbound);
 
         // payload is null when we expect failure
         if test.expect_fail {
             if let Ok(ut) = UntrustedToken::<Public, V3>::try_from(&test.token) {
-                assert!(PublicToken::verify(&pk, &ut, footer, Some(implicit_assert)).is_err());
+                assert!(PublicToken::verify(&pk, &ut, footer, &binding).is_err());
             }
 
             return;
@@ -392,21 +417,42 @@ mod test_vectors {
 
         let message = test.payload.as_ref().unwrap().as_str().unwrap();
 
-        let actual =
-            PublicToken::sign(&sk, message.as_bytes(), footer, Some(implicit_assert)).unwrap();
+        let actual = PublicToken::sign(&sk, message.as_bytes(), footer, &binding).unwrap();
         let ut = UntrustedToken::<Public, V3>::try_from(&actual).unwrap();
-        let trusted = PublicToken::verify(&pk, &ut, footer, Some(implicit_assert)).unwrap();
+        let trusted = PublicToken::verify(&pk, &ut, footer, &binding).unwrap();
         assert_eq!(trusted.payload(), message);
         assert_eq!(trusted.footer(), test.footer.as_bytes());
         assert_eq!(trusted.header(), PublicToken::HEADER);
         assert_eq!(trusted.implicit_assert(), implicit_assert);
+        if implicit_assert.is_empty() {
+            assert_eq!(
+                trusted.implicit_assert_binding(),
+                &crate::token::Binding::None
+            );
+        } else {
+            assert_eq!(
+                trusted.implicit_assert_binding(),
+                &crate::token::Binding::Context(implicit_assert.to_vec())
+            );
+        }
 
         let ut = UntrustedToken::<Public, V3>::try_from(&test.token).unwrap();
-        let trusted = PublicToken::verify(&pk, &ut, footer, Some(implicit_assert)).unwrap();
+        let trusted = PublicToken::verify(&pk, &ut, footer, &binding).unwrap();
         assert_eq!(trusted.payload(), message);
         assert_eq!(trusted.footer(), test.footer.as_bytes());
         assert_eq!(trusted.header(), PublicToken::HEADER);
         assert_eq!(trusted.implicit_assert(), implicit_assert);
+        if implicit_assert.is_empty() {
+            assert_eq!(
+                trusted.implicit_assert_binding(),
+                &crate::token::Binding::None
+            );
+        } else {
+            assert_eq!(
+                trusted.implicit_assert_binding(),
+                &crate::token::Binding::Context(implicit_assert.to_vec())
+            );
+        }
     }
 
     #[test]
@@ -553,10 +599,16 @@ mod test_tokens {
     fn test_gen_keypair() {
         let kp = AsymmetricKeyPair::<V3>::generate().unwrap();
 
-        let token = PublicToken::sign(&kp.secret, MESSAGE.as_bytes(), None, None).unwrap();
+        let token = PublicToken::sign(
+            &kp.secret,
+            MESSAGE.as_bytes(),
+            None,
+            &ImplicitAssertion::Unbound,
+        )
+        .unwrap();
 
         let ut = UntrustedToken::<Public, V3>::try_from(&token).unwrap();
-        assert!(PublicToken::verify(&kp.public, &ut, None, None).is_ok());
+        assert!(PublicToken::verify(&kp.public, &ut, None, &ImplicitAssertion::Unbound).is_ok());
     }
 
     #[test]
@@ -567,7 +619,7 @@ mod test_tokens {
             &kp.secret,
             MESSAGE.as_bytes(),
             Some(FOOTER.as_bytes()),
-            None,
+            &ImplicitAssertion::Unbound,
         )
         .unwrap();
 
@@ -577,7 +629,7 @@ mod test_tokens {
                 &kp.public,
                 &untrusted_token,
                 Some(untrusted_token.untrusted_footer()),
-                None
+                &ImplicitAssertion::Unbound
             )
             .is_ok()
         );
@@ -588,10 +640,16 @@ mod test_tokens {
         let test_sk = AsymmetricSecretKey::<V3>::from(&TEST_SK_BYTES).unwrap();
         let test_pk = AsymmetricPublicKey::<V3>::from(&TEST_PK_BYTES).unwrap();
 
-        let token = PublicToken::sign(&test_sk, MESSAGE.as_bytes(), None, None).unwrap();
+        let token = PublicToken::sign(
+            &test_sk,
+            MESSAGE.as_bytes(),
+            None,
+            &ImplicitAssertion::Unbound,
+        )
+        .unwrap();
         let ut = UntrustedToken::<Public, V3>::try_from(&token).unwrap();
 
-        assert!(PublicToken::verify(&test_pk, &ut, None, None).is_ok());
+        assert!(PublicToken::verify(&test_pk, &ut, None, &ImplicitAssertion::Unbound).is_ok());
     }
 
     #[test]
@@ -603,11 +661,17 @@ mod test_tokens {
 
         // We create a token with Some(footer) and with None
         let actual_some = UntrustedToken::<Public, V3>::try_from(
-            &PublicToken::sign(&test_sk, message, Some(FOOTER.as_bytes()), None).unwrap(),
+            &PublicToken::sign(
+                &test_sk,
+                message,
+                Some(FOOTER.as_bytes()),
+                &ImplicitAssertion::Unbound,
+            )
+            .unwrap(),
         )
         .unwrap();
         let actual_none = UntrustedToken::<Public, V3>::try_from(
-            &PublicToken::sign(&test_sk, message, None, None).unwrap(),
+            &PublicToken::sign(&test_sk, message, None, &ImplicitAssertion::Unbound).unwrap(),
         )
         .unwrap();
 
@@ -616,34 +680,131 @@ mod test_tokens {
 
         // We should be able to validate with None if created with Some() (excludes constant-time
         // comparison with known value)
-        assert!(PublicToken::verify(&test_pk, &actual_some, None, None).is_ok());
+        assert!(
+            PublicToken::verify(&test_pk, &actual_some, None, &ImplicitAssertion::Unbound).is_ok()
+        );
         // We should be able to validate with Some() if created with Some()
-        assert!(PublicToken::verify(&test_pk, &actual_some, Some(FOOTER.as_bytes()), None).is_ok());
+        assert!(
+            PublicToken::verify(
+                &test_pk,
+                &actual_some,
+                Some(FOOTER.as_bytes()),
+                &ImplicitAssertion::Unbound
+            )
+            .is_ok()
+        );
         // We should NOT be able to validate with Some() if created with None
         assert!(
-            PublicToken::verify(&test_pk, &actual_none, Some(FOOTER.as_bytes()), None).is_err()
+            PublicToken::verify(
+                &test_pk,
+                &actual_none,
+                Some(FOOTER.as_bytes()),
+                &ImplicitAssertion::Unbound
+            )
+            .is_err()
         );
     }
 
     #[test]
-    fn implicit_none_some_empty_is_same() {
+    fn empty_context_is_rejected_and_unbound_is_explicit() {
         let test_sk = AsymmetricSecretKey::<V3>::from(&TEST_SK_BYTES).unwrap();
         let test_pk = AsymmetricPublicKey::<V3>::from(&TEST_PK_BYTES).unwrap();
         let message =
             b"{\"data\":\"this is a signed message\",\"exp\":\"2019-01-01T00:00:00+00:00\"}";
-        let implicit = b"";
 
-        let actual_some = UntrustedToken::<Public, V3>::try_from(
-            &PublicToken::sign(&test_sk, message, None, Some(implicit)).unwrap(),
+        assert_eq!(
+            ImplicitAssertion::bound(b"").unwrap_err(),
+            Error::EmptyImplicitAssertion
+        );
+
+        // A directly-constructed empty binding is rejected instead of silently degenerating
+        // into the unbound case.
+        let empty_binding = ImplicitAssertion::Bound(Vec::new());
+        assert_eq!(
+            PublicToken::sign(&test_sk, message, None, &empty_binding).unwrap_err(),
+            Error::EmptyImplicitAssertion
+        );
+        let untrusted = UntrustedToken::<Public, V3>::try_from(
+            &PublicToken::sign(&test_sk, message, None, &ImplicitAssertion::Unbound).unwrap(),
         )
         .unwrap();
-        let actual_none = UntrustedToken::<Public, V3>::try_from(
-            &PublicToken::sign(&test_sk, message, None, None).unwrap(),
+        assert_eq!(
+            PublicToken::verify(&test_pk, &untrusted, None, &empty_binding).unwrap_err(),
+            Error::EmptyImplicitAssertion
+        );
+
+        let unbound = UntrustedToken::<Public, V3>::try_from(
+            &PublicToken::sign(&test_sk, message, None, &ImplicitAssertion::Unbound).unwrap(),
+        )
+        .unwrap();
+        let trusted =
+            PublicToken::verify(&test_pk, &unbound, None, &ImplicitAssertion::Unbound).unwrap();
+        assert_eq!(
+            trusted.implicit_assert_binding(),
+            &crate::token::Binding::None
+        );
+        assert!(trusted.implicit_assert().is_empty());
+        assert!(
+            PublicToken::verify(
+                &test_pk,
+                &unbound,
+                None,
+                &ImplicitAssertion::bound(b"session-a").unwrap()
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn context_bound_tokens_do_not_cross_sessions() {
+        let test_sk = AsymmetricSecretKey::<V3>::from(&TEST_SK_BYTES).unwrap();
+        let test_pk = AsymmetricPublicKey::<V3>::from(&TEST_PK_BYTES).unwrap();
+        let message =
+            b"{\"data\":\"this is a signed message\",\"exp\":\"2019-01-01T00:00:00+00:00\"}";
+        let session_a = ImplicitAssertion::bound(b"session-a").unwrap();
+        let session_b = ImplicitAssertion::bound(b"session-b").unwrap();
+
+        let token_a = UntrustedToken::<Public, V3>::try_from(
+            &PublicToken::sign(&test_sk, message, None, &session_a).unwrap(),
         )
         .unwrap();
 
-        assert!(PublicToken::verify(&test_pk, &actual_none, None, Some(implicit)).is_ok());
-        assert!(PublicToken::verify(&test_pk, &actual_some, None, None).is_ok());
+        let trusted = PublicToken::verify(&test_pk, &token_a, None, &session_a).unwrap();
+        assert_eq!(
+            trusted.implicit_assert_binding(),
+            &crate::token::Binding::Context(b"session-a".to_vec())
+        );
+        assert_eq!(trusted.implicit_assert(), b"session-a");
+        assert!(PublicToken::verify(&test_pk, &token_a, None, &session_b).is_err());
+        assert!(
+            PublicToken::verify(&test_pk, &token_a, None, &ImplicitAssertion::Unbound).is_err()
+        );
+    }
+
+    #[test]
+    fn legacy_unbound_token_is_verifiable_with_explicit_choice() {
+        let test_pk = AsymmetricPublicKey::<V3>::from(&TEST_PK_BYTES).unwrap();
+
+        // This fixed token was created without an implicit assertion. It remains verifiable,
+        // but only when the unbound mode is selected explicitly.
+        assert!(
+            PublicToken::verify(
+                &test_pk,
+                &UntrustedToken::<Public, V3>::try_from(VALID_PUBLIC_TOKEN).unwrap(),
+                Some(FOOTER.as_bytes()),
+                &ImplicitAssertion::Unbound
+            )
+            .is_ok()
+        );
+        assert!(
+            PublicToken::verify(
+                &test_pk,
+                &UntrustedToken::<Public, V3>::try_from(VALID_PUBLIC_TOKEN).unwrap(),
+                Some(FOOTER.as_bytes()),
+                &ImplicitAssertion::bound(b"some-context").unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -652,7 +813,7 @@ mod test_tokens {
         let test_sk = AsymmetricSecretKey::<V3>::from(&TEST_SK_BYTES).unwrap();
 
         assert_eq!(
-            PublicToken::sign(&test_sk, b"", None, None).unwrap_err(),
+            PublicToken::sign(&test_sk, b"", None, &ImplicitAssertion::Unbound).unwrap_err(),
             Error::EmptyPayload
         );
     }
@@ -666,7 +827,7 @@ mod test_tokens {
                 &test_pk,
                 &UntrustedToken::<Public, V3>::try_from(VALID_PUBLIC_TOKEN).unwrap(),
                 Some(FOOTER.replace("kid", "mid").as_bytes()),
-                None
+                &ImplicitAssertion::Unbound
             )
             .unwrap_err(),
             Error::TokenValidation
@@ -681,7 +842,7 @@ mod test_tokens {
                 &test_pk,
                 &UntrustedToken::<Public, V3>::try_from(VALID_PUBLIC_TOKEN).unwrap(),
                 Some(FOOTER.as_bytes()),
-                None
+                &ImplicitAssertion::Unbound
             )
             .is_ok()
         );
@@ -690,7 +851,7 @@ mod test_tokens {
                 &test_pk,
                 &UntrustedToken::<Public, V3>::try_from(VALID_PUBLIC_TOKEN).unwrap(),
                 Some(FOOTER.as_bytes()),
-                Some(b"WRONG IMPLICIT")
+                &ImplicitAssertion::bound(b"WRONG IMPLICIT").unwrap()
             )
             .unwrap_err(),
             Error::TokenValidation
@@ -706,7 +867,7 @@ mod test_tokens {
                 &test_pk,
                 &UntrustedToken::<Public, V3>::try_from(VALID_PUBLIC_TOKEN).unwrap(),
                 Some(b""),
-                None
+                &ImplicitAssertion::Unbound
             )
             .unwrap_err(),
             Error::TokenValidation
@@ -728,7 +889,7 @@ mod test_tokens {
                 &test_pk,
                 &UntrustedToken::<Public, V3>::try_from(&invalid_public).unwrap(),
                 Some(FOOTER.as_bytes()),
-                None
+                &ImplicitAssertion::Unbound
             )
             .unwrap_err(),
             Error::TokenValidation
@@ -754,7 +915,7 @@ mod test_tokens {
                 &test_pk,
                 &UntrustedToken::<Public, V3>::try_from(&invalid_public).unwrap(),
                 Some(FOOTER.as_bytes()),
-                None
+                &ImplicitAssertion::Unbound
             )
             .unwrap_err(),
             Error::TokenValidation
@@ -772,7 +933,7 @@ mod test_tokens {
                 &bad_pk,
                 &UntrustedToken::<Public, V3>::try_from(VALID_PUBLIC_TOKEN).unwrap(),
                 Some(FOOTER.as_bytes()),
-                None
+                &ImplicitAssertion::Unbound
             )
             .unwrap_err(),
             Error::TokenValidation

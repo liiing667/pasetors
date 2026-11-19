@@ -6,7 +6,7 @@ use crate::keys::{
     AsymmetricKeyPair, AsymmetricPublicKey, AsymmetricSecretKey, Generate, SymmetricKey,
 };
 use crate::pae;
-use crate::token::{Local, Public, TrustedToken, UntrustedToken};
+use crate::token::{ImplicitAssertion, Local, Public, TrustedToken, UntrustedToken};
 use crate::version::private::Version;
 use alloc::string::String;
 use alloc::vec::Vec;
@@ -159,7 +159,7 @@ impl PublicToken {
         let sig = Signature::from_slice(s).map_err(|_| Error::TokenValidation)?;
 
         if pk.verify(m2, &sig).is_ok() {
-            TrustedToken::_new(Self::HEADER, m, f, &[])
+            TrustedToken::_new(Self::HEADER, m, f, &ImplicitAssertion::Unbound)
         } else {
             Err(Error::TokenValidation)
         }
@@ -266,7 +266,7 @@ impl LocalToken {
             Some(pre_auth.as_ref()),
             &mut out,
         ) {
-            Ok(()) => TrustedToken::_new(Self::HEADER, &out, f, &[]),
+            Ok(()) => TrustedToken::_new(Self::HEADER, &out, f, &ImplicitAssertion::Unbound),
             Err(orion::errors::UnknownCryptoError) => Err(Error::TokenValidation),
         }
     }

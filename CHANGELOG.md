@@ -1,3 +1,17 @@
+### Unreleased
+
+- (BREAKING) Replace the optional `implicit_assert: Option<&[u8]>` parameter on the v3/v4
+  token APIs (`public`/`local`, `version3::PublicToken` and `version4::{PublicToken, LocalToken}`)
+  with a required, explicit `ImplicitAssertion` choice. `ImplicitAssertion::Bound(context)`
+  binds a token to non-empty protocol-context identity (e.g. a session) and rejects empty
+  material with `Error::EmptyImplicitAssertion`, while `ImplicitAssertion::Unbound` must be
+  selected deliberately to create or verify tokens without a binding. This prevents the same
+  token from being silently reused across different session contexts when callers omit the
+  implicit assertion.
+- Add `TrustedToken::implicit_assert_binding()` returning a `Binding`, so verification results
+  show whether a token was validated against context material (`Binding::Context`) or was
+  explicitly accepted as unbound (`Binding::None`).
+
 ### 0.8.1
 
 __Date:__ August 30, 2026.

@@ -15,7 +15,7 @@
 //! use pasetors::claims::{Claims, ClaimsValidationRules};
 //! use pasetors::keys::{Generate, AsymmetricKeyPair, AsymmetricSecretKey, AsymmetricPublicKey};
 //! use pasetors::{public, Public, version4::V4};
-//! use pasetors::token::{UntrustedToken, TrustedToken};
+//! use pasetors::token::{ImplicitAssertion, UntrustedToken, TrustedToken};
 //! use core::convert::TryFrom;
 //!
 //! // Setup the default claims, which include `iat` and `nbf` as the current time and `exp` of one hour.
@@ -25,7 +25,9 @@
 //!
 //! // Generate the keys and sign the claims.
 //! let kp = AsymmetricKeyPair::<V4>::generate()?;
-//! let pub_token = public::sign(&kp.secret, &claims, None, Some(b"implicit assertion"))?;
+//! // Explicitly bind the token to a protocol-context identity (here a session identifier).
+//! let session = ImplicitAssertion::bound(b"session-1234")?;
+//! let pub_token = public::sign(&kp.secret, &claims, None, &session)?;
 //!
 //! // Decide how we want to validate the claims after verifying the token itself.
 //! // The default verifies the `nbf`, `iat` and `exp` claims. `nbf` and `iat` are always
@@ -34,8 +36,10 @@
 //! // manually.
 //! let validation_rules = ClaimsValidationRules::new();
 //! let untrusted_token = UntrustedToken::<Public, V4>::try_from(&pub_token)?;
-//! let trusted_token = public::verify(&kp.public, &untrusted_token, &validation_rules, None, Some(b"implicit assertion"))?;
+//! let trusted_token = public::verify(&kp.public, &untrusted_token, &validation_rules, None, &session)?;
 //! assert_eq!(&claims, trusted_token.payload_claims().unwrap());
+//! // The result records where the binding came from.
+//! assert_eq!(trusted_token.implicit_assert_binding(), &pasetors::token::Binding::Context(b"session-1234".to_vec()));
 //!
 //! let claims = trusted_token.payload_claims().unwrap();
 //!
@@ -50,7 +54,7 @@
 //! use pasetors::claims::{Claims, ClaimsValidationRules};
 //! use pasetors::keys::{Generate, SymmetricKey};
 //! use pasetors::{local, Local, version4::V4};
-//! use pasetors::token::UntrustedToken;
+//! use pasetors::token::{ImplicitAssertion, UntrustedToken};
 //! use core::convert::TryFrom;
 //!
 //! // Setup the default claims, which include `iat` and `nbf` as the current time and `exp` of one hour.
@@ -60,7 +64,9 @@
 //!
 //! // Generate the key and encrypt the claims.
 //! let sk = SymmetricKey::<V4>::generate()?;
-//! let token = local::encrypt(&sk, &claims, None, Some(b"implicit assertion"))?;
+//! // Explicitly bind the token to a protocol-context identity (here a session identifier).
+//! let session = ImplicitAssertion::bound(b"session-1234")?;
+//! let token = local::encrypt(&sk, &claims, None, &session)?;
 //!
 //! // Decide how we want to validate the claims after verifying the token itself.
 //! // The default verifies the `nbf`, `iat` and `exp` claims. `nbf` and `iat` are always
@@ -69,7 +75,7 @@
 //! // manually.
 //! let validation_rules = ClaimsValidationRules::new();
 //! let untrusted_token = UntrustedToken::<Local, V4>::try_from(&token)?;
-//! let trusted_token = local::decrypt(&sk, &untrusted_token, &validation_rules, None, Some(b"implicit assertion"))?;
+//! let trusted_token = local::decrypt(&sk, &untrusted_token, &validation_rules, None, &session)?;
 //! assert_eq!(&claims, trusted_token.payload_claims().unwrap());
 //!
 //! let claims = trusted_token.payload_claims().unwrap();
@@ -141,7 +147,7 @@
 //! use pasetors::footer::Footer;
 //! use pasetors::keys::{Generate, AsymmetricKeyPair};
 //! use pasetors::{public, Public, version4::V4};
-//! use pasetors::token::UntrustedToken;
+//! use pasetors::token::{ImplicitAssertion, UntrustedToken};
 //! use core::convert::TryFrom;
 //!
 //! // Generate the key used to later sign a token.
@@ -154,13 +160,14 @@
 //! footer.add_additional("custom_footer_claim", "custom_value")?;
 //!
 //! let mut claims = Claims::new()?;
-//! let pub_token = public::sign(&kp.secret, &claims, Some(&footer), Some(b"implicit assertion"))?;
+//! let session = ImplicitAssertion::bound(b"implicit assertion")?;
+//! let pub_token = public::sign(&kp.secret, &claims, Some(&footer), &session)?;
 //!
 //! // If we receive a token that needs to be verified, we can still try to parse a Footer from it
 //! // as long one was used during creation, if we don't know it beforehand.
 //! let validation_rules = ClaimsValidationRules::new();
 //! let untrusted_token = UntrustedToken::<Public, V4>::try_from(&pub_token)?;
-//! let trusted_token = public::verify(&kp.public, &untrusted_token, &validation_rules, None, Some(b"implicit assertion"))?;
+//! let trusted_token = public::verify(&kp.public, &untrusted_token, &validation_rules, None, &session)?;
 //! let trusted_footer = Footer::try_from(&trusted_token)?;
 //!
 //! let mut kid = String::new();
@@ -256,15 +263,20 @@ pub mod public {
     use crate::errors::Error;
     use crate::footer::Footer;
     use crate::keys::{AsymmetricPublicKey, AsymmetricSecretKey};
-    use crate::token::{TrustedToken, UntrustedToken};
+    use crate::token::{ImplicitAssertion, TrustedToken, UntrustedToken};
     use crate::version4::V4;
 
     /// Create a public token using the latest PASETO version (v4).
+    ///
+    /// `implicit_assert` is a required, explicit protocol-context choice. Use
+    /// [`ImplicitAssertion::Bound`] to bind the token to non-empty context identity such as a
+    /// session, or [`ImplicitAssertion::Unbound`] only when a token intentionally carries no
+    /// binding.
     pub fn sign(
         secret_key: &AsymmetricSecretKey<V4>,
         message: &Claims,
         footer: Option<&Footer>,
-        implicit_assert: Option<&[u8]>,
+        implicit_assert: &ImplicitAssertion,
     ) -> Result<String, Error> {
         match footer {
             Some(f) => version4::PublicToken::sign(
@@ -284,12 +296,18 @@ pub mod public {
 
     /// Verify a public token using the latest PASETO version (v4). If verification passes,
     /// validate the claims according to the `validation_rules`.
+    ///
+    /// `implicit_assert` is a required, explicit protocol-context choice. A token created with
+    /// [`ImplicitAssertion::Bound`] can only be verified with the same context identity, and a
+    /// token without a binding can only be verified with [`ImplicitAssertion::Unbound`]. The
+    /// selected binding source is available via
+    /// [`TrustedToken::implicit_assert_binding()`].
     pub fn verify(
         public_key: &AsymmetricPublicKey<V4>,
         token: &UntrustedToken<Public, V4>,
         validation_rules: &ClaimsValidationRules,
         footer: Option<&Footer>,
-        implicit_assert: Option<&[u8]>,
+        implicit_assert: &ImplicitAssertion,
     ) -> Result<TrustedToken, Error> {
         let mut trusted_token = match footer {
             Some(f) => version4::PublicToken::verify(
@@ -318,15 +336,20 @@ pub mod local {
     use crate::errors::Error;
     use crate::footer::Footer;
     use crate::keys::SymmetricKey;
-    use crate::token::{TrustedToken, UntrustedToken};
+    use crate::token::{ImplicitAssertion, TrustedToken, UntrustedToken};
     use crate::version4::V4;
 
     /// Create a local token using the latest PASETO version (v4).
+    ///
+    /// `implicit_assert` is a required, explicit protocol-context choice. Use
+    /// [`ImplicitAssertion::Bound`] to bind the token to non-empty context identity such as a
+    /// session, or [`ImplicitAssertion::Unbound`] only when a token intentionally carries no
+    /// binding.
     pub fn encrypt(
         secret_key: &SymmetricKey<V4>,
         message: &Claims,
         footer: Option<&Footer>,
-        implicit_assert: Option<&[u8]>,
+        implicit_assert: &ImplicitAssertion,
     ) -> Result<String, Error> {
         match footer {
             Some(f) => version4::LocalToken::encrypt(
@@ -346,12 +369,18 @@ pub mod local {
 
     /// Verify a local token using the latest PASETO version (v4). If verification passes,
     /// validate the claims according to the `validation_rules`.
+    ///
+    /// `implicit_assert` is a required, explicit protocol-context choice. A token created with
+    /// [`ImplicitAssertion::Bound`] can only be decrypted with the same context identity, and a
+    /// token without a binding can only be decrypted with [`ImplicitAssertion::Unbound`]. The
+    /// selected binding source is available via
+    /// [`TrustedToken::implicit_assert_binding()`].
     pub fn decrypt(
         secret_key: &SymmetricKey<V4>,
         token: &UntrustedToken<Local, V4>,
         validation_rules: &ClaimsValidationRules,
         footer: Option<&Footer>,
-        implicit_assert: Option<&[u8]>,
+        implicit_assert: &ImplicitAssertion,
     ) -> Result<TrustedToken, Error> {
         let mut trusted_token = match footer {
             Some(f) => version4::LocalToken::decrypt(

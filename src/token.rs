@@ -39,6 +39,93 @@ pub struct Public;
 /// A local token.
 pub struct Local;
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_derive::Serialize, serde_derive::Deserialize)
+)]
+/// Explicit choice of the protocol-context identity that a v3/v4 token is bound to through
+/// its implicit assertion.
+///
+/// PASETO v3 and v4 include an implicit assertion in the authenticated/encrypted data of a
+/// token. It is never stored in the serialized token, so the same token bytes can be replayed
+/// in a different protocol context if callers do not bind it to context-specific material.
+///
+/// This type forces callers to make that choice explicitly:
+///
+/// - [`ImplicitAssertion::Bound`] binds the token to the supplied non-empty context identity
+///   (for example a session identifier, an audience or an application-specific context string).
+///   The same token cannot be verified in any other context, because a mismatching implicit
+///   assertion fails verification.
+/// - [`ImplicitAssertion::Unbound`] is the explicit statement that the token intentionally has
+///   no context binding. This is required to verify legacy tokens that were created without an
+///   implicit assertion.
+///
+/// An empty slice is not a valid binding: it is cryptographically identical to no implicit
+/// assertion and would silently degenerate into [`ImplicitAssertion::Unbound`]. Requesting an
+/// empty binding therefore returns [`Error::EmptyImplicitAssertion`].
+///
+/// [`Error::EmptyImplicitAssertion`]: crate::errors::Error::EmptyImplicitAssertion
+pub enum ImplicitAssertion {
+    /// Bind the token to non-empty protocol-context identity bytes.
+    Bound(Vec<u8>),
+    /// Explicitly create/verify a token with no implicit assertion binding.
+    Unbound,
+}
+
+impl ImplicitAssertion {
+    /// Bind the token to non-empty protocol-context identity bytes.
+    ///
+    /// Returns [`Error::EmptyImplicitAssertion`] if `context` is empty, because an empty
+    /// implicit assertion cannot be distinguished from an unbound token.
+    ///
+    /// [`Error::EmptyImplicitAssertion`]: crate::errors::Error::EmptyImplicitAssertion
+    pub fn bound(context: &[u8]) -> Result<Self, Error> {
+        if context.is_empty() {
+            return Err(Error::EmptyImplicitAssertion);
+        }
+
+        Ok(Self::Bound(context.to_vec()))
+    }
+
+    /// Resolve this explicit choice into the raw implicit-assertion bytes used by the protocol.
+    pub(crate) fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Bound(context) => context.as_slice(),
+            Self::Unbound => &[],
+        }
+    }
+
+    /// Ensure an explicitly requested binding actually carries non-empty context material.
+    ///
+    /// This guards every token entry point so a directly constructed
+    /// `ImplicitAssertion::Bound(Vec::new())` cannot silently behave like an unbound token.
+    pub(crate) fn validate(&self) -> Result<(), Error> {
+        match self {
+            Self::Bound(context) if context.is_empty() => Err(Error::EmptyImplicitAssertion),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[cfg_attr(
+    feature = "serde",
+    derive(serde_derive::Serialize, serde_derive::Deserialize)
+)]
+/// The origin of the implicit-assertion binding that was used to validate a [`TrustedToken`].
+///
+/// This makes the binding source visible in verification results, so callers can tell apart a
+/// token that was verified against explicit context material from one that was explicitly
+/// accepted without a binding.
+pub enum Binding {
+    /// The token was verified with the contained implicit-assertion bytes.
+    Context(Vec<u8>),
+    /// The token was explicitly verified with no implicit assertion.
+    #[default]
+    None,
+}
+
 impl<V: Version> Purpose<V> for Public {
     fn validate_header(token: &str) -> Result<(), Error> {
         if token.is_empty() || !token.starts_with(V::PUBLIC_HEADER) {
@@ -118,6 +205,8 @@ pub struct TrustedToken {
         serde(skip_serializing_if = "Vec::is_empty", default)
     )]
     implicit_assert: Vec<u8>,
+    #[cfg_attr(feature = "serde", serde(default))]
+    implicit_assert_binding: Binding,
 }
 
 impl TrustedToken {
@@ -125,15 +214,21 @@ impl TrustedToken {
         header: &str,
         payload: &[u8],
         footer: &[u8],
-        implicit_assert: &[u8],
+        implicit_assert: &ImplicitAssertion,
     ) -> Result<Self, Error> {
+        let implicit_assert_binding = match implicit_assert {
+            ImplicitAssertion::Bound(context) => Binding::Context(context.clone()),
+            ImplicitAssertion::Unbound => Binding::None,
+        };
+
         Ok(Self {
             header: header.to_string(),
             payload: String::from_utf8(payload.to_vec()).map_err(|_| Error::PayloadInvalidUtf8)?,
             #[cfg(feature = "std")]
             payload_claims: None,
             footer: footer.to_vec(),
-            implicit_assert: implicit_assert.to_vec(),
+            implicit_assert: implicit_assert.as_bytes().to_vec(),
+            implicit_assert_binding,
         })
     }
 
@@ -178,10 +273,23 @@ impl TrustedToken {
 
     /// Get the implicit assertion used to create the token.
     ///
-    /// Empty if `None` was used during creation.
+    /// Empty if [`ImplicitAssertion::Unbound`] was used during creation.
     /// If token was created using `V2`, then it will always be empty.
     pub fn implicit_assert(&self) -> &[u8] {
         &self.implicit_assert
+    }
+
+    /// Get the source of the implicit-assertion binding that was used to validate this token.
+    ///
+    /// - [`Binding::Context`] contains the non-empty protocol-context identity the token is
+    ///   bound to.
+    /// - [`Binding::None`] means the token was explicitly accepted as
+    ///   [`ImplicitAssertion::Unbound`].
+    ///
+    /// For a `V2` token this is always [`Binding::None`], as version 2 has no implicit
+    /// assertion.
+    pub fn implicit_assert_binding(&self) -> &Binding {
+        &self.implicit_assert_binding
     }
 }
 
@@ -648,7 +756,7 @@ mod tests_untrusted {
             "v3.local.",
             b"test msg",
             footer.to_string().unwrap().as_bytes(),
-            b"",
+            &ImplicitAssertion::Unbound,
         )
         .unwrap();
         assert!(Footer::try_from(&tt).is_ok());
@@ -664,7 +772,7 @@ mod tests_untrusted {
             "v3.local.",
             b"test msg",
             footer.to_string().unwrap().as_bytes(),
-            b"",
+            &ImplicitAssertion::Unbound,
         )
         .unwrap();
         let claims = Claims::new().unwrap();
@@ -691,7 +799,8 @@ mod test_trusted {
         claims.add_additional("test", "serde").unwrap();
         let mut footer = Footer::default();
         footer.add_additional("test", "footer").unwrap();
-        let token = local::encrypt(&sk, &claims, Some(&footer), None).unwrap();
+        let token =
+            local::encrypt(&sk, &claims, Some(&footer), &ImplicitAssertion::Unbound).unwrap();
         let validation_rules = ClaimsValidationRules::default();
         let untrusted = UntrustedToken::<Local, V4>::try_from(&token).unwrap();
 
@@ -703,8 +812,14 @@ mod test_trusted {
             .unwrap()
         );
 
-        let trusted =
-            local::decrypt(&sk, &untrusted, &validation_rules, Some(&footer), None).unwrap();
+        let trusted = local::decrypt(
+            &sk,
+            &untrusted,
+            &validation_rules,
+            Some(&footer),
+            &ImplicitAssertion::Unbound,
+        )
+        .unwrap();
 
         let json = serde_json::to_string(&trusted).unwrap();
         // a couple of manual assertions that some keys values have appeared in the JSON
@@ -715,12 +830,47 @@ mod test_trusted {
         assert!(json.contains(
             "\"footer\":[123,34,116,101,115,116,34,58,34,102,111,111,116,101,114,34,125]"
         ));
-        // implicit_assert = None so shouldn't appear in the serialized version
-        assert!(!json.contains("implicit_assert"));
+        // No context bytes were bound, so the raw implicit assertion stays empty/omitted,
+        // while the explicit binding source is recorded.
+        assert!(!json.contains("\"implicit_assert\":"));
+        assert!(json.contains("\"implicit_assert_binding\":\"None\""));
 
         let output: TrustedToken = serde_json::from_str(&json).unwrap();
 
         assert_eq!(output, trusted);
         assert_eq!(output.payload_claims.unwrap(), claims);
+    }
+
+    #[test]
+    fn serde_round_trip_preserves_context_binding() {
+        use crate::keys::Generate;
+        use crate::version4::V4;
+
+        let sk = SymmetricKey::<V4>::generate().unwrap();
+        let claims = Claims::new().unwrap();
+        let binding = ImplicitAssertion::bound(b"session-xyz").unwrap();
+
+        let token = local::encrypt(&sk, &claims, None, &binding).unwrap();
+        let untrusted = UntrustedToken::<Local, V4>::try_from(&token).unwrap();
+        let trusted = local::decrypt(
+            &sk,
+            &untrusted,
+            &ClaimsValidationRules::new(),
+            None,
+            &binding,
+        )
+        .unwrap();
+
+        let json = serde_json::to_string(&trusted).unwrap();
+        assert!(json.contains(
+            "\"implicit_assert_binding\":{\"Context\":[115,101,115,115,105,111,110,45,120,121,122]}"
+        ));
+
+        let output: TrustedToken = serde_json::from_str(&json).unwrap();
+        assert_eq!(output, trusted);
+        assert_eq!(
+            output.implicit_assert_binding(),
+            &Binding::Context(b"session-xyz".to_vec())
+        );
     }
 }

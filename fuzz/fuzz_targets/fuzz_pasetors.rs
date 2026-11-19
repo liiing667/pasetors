@@ -10,7 +10,7 @@ use core::convert::TryFrom;
 use ed25519_compact::{KeyPair, Seed};
 use pasetors::claims::*;
 use pasetors::keys::*;
-use pasetors::token::UntrustedToken;
+use pasetors::token::{ImplicitAssertion, UntrustedToken};
 use pasetors::{version2, version3, version4};
 use pasetors::{version2::V2, version3::V3, version4::V4, Local, Public};
 use rand_chacha::ChaCha20Rng;
@@ -81,17 +81,17 @@ fn fuzztest_v3(data: &[u8]) {
 
     // Public
     if let Ok(untrusted) = UntrustedToken::<Public, V3>::try_from(&message) {
-        if version3::PublicToken::verify(&kp.public, &untrusted, None, None).is_ok() {
+        if version3::PublicToken::verify(&kp.public, &untrusted, None, &ImplicitAssertion::Unbound).is_ok() {
             panic!("Invalid token was verified with version 3");
         }
     }
 
     let public_token = UntrustedToken::<Public, V3>::try_from(
-        &version3::PublicToken::sign(&kp.secret, message.as_bytes(), None, None)
+        &version3::PublicToken::sign(&kp.secret, message.as_bytes(), None, &ImplicitAssertion::Unbound)
             .unwrap(),
     )
     .unwrap();
-    match version3::PublicToken::verify(&kp.public, &public_token, None, None) {
+    match version3::PublicToken::verify(&kp.public, &public_token, None, &ImplicitAssertion::Unbound) {
         Ok(trusted) => {
             assert_eq!(trusted.payload(), message);
             assert!(trusted.footer().is_empty());
@@ -118,16 +118,16 @@ fn fuzztest_v4(data: &[u8], csprng: &mut ChaCha20Rng) {
 
     // Public
     if let Ok(untrusted) = UntrustedToken::<Public, V4>::try_from(&message) {
-        if version4::PublicToken::verify(&pk, &untrusted, None, None).is_ok() {
+        if version4::PublicToken::verify(&pk, &untrusted, None, &ImplicitAssertion::Unbound).is_ok() {
             panic!("Invalid token was verified with version 4");
         }
     }
 
     let public_token = UntrustedToken::<Public, V4>::try_from(
-        &version4::PublicToken::sign(&sk, message.as_bytes(), None, None).unwrap(),
+        &version4::PublicToken::sign(&sk, message.as_bytes(), None, &ImplicitAssertion::Unbound).unwrap(),
     )
     .unwrap();
-    match version4::PublicToken::verify(&pk, &public_token, None, None) {
+    match version4::PublicToken::verify(&pk, &public_token, None, &ImplicitAssertion::Unbound) {
         Ok(trusted) => {
             assert_eq!(trusted.payload(), message);
             assert!(trusted.footer().is_empty());
@@ -137,16 +137,16 @@ fn fuzztest_v4(data: &[u8], csprng: &mut ChaCha20Rng) {
     };
     // Local
     if let Ok(untrusted) = UntrustedToken::<Local, V4>::try_from(&message) {
-        if version4::LocalToken::decrypt(&sk_local, &untrusted, None, None).is_ok() {
+        if version4::LocalToken::decrypt(&sk_local, &untrusted, None, &ImplicitAssertion::Unbound).is_ok() {
             panic!("Invalid token was verified with version 4");
         }
     }
 
     let local_token = UntrustedToken::<Local, V4>::try_from(
-        &version4::LocalToken::encrypt(&sk_local, message.as_bytes(), None, None).unwrap(),
+        &version4::LocalToken::encrypt(&sk_local, message.as_bytes(), None, &ImplicitAssertion::Unbound).unwrap(),
     )
     .unwrap();
-    match version4::LocalToken::decrypt(&sk_local, &local_token, None, None) {
+    match version4::LocalToken::decrypt(&sk_local, &local_token, None, &ImplicitAssertion::Unbound) {
         Ok(trusted) => {
             assert_eq!(trusted.payload(), message);
             assert!(trusted.footer().is_empty());
@@ -177,11 +177,11 @@ fn fuzz_highlevel(data: &[u8], csprng: &mut ChaCha20Rng) {
     let validation_rules = ClaimsValidationRules::new();
 
     let public_token = UntrustedToken::<Public, V4>::try_from(
-        &pasetors::public::sign(&sk, &claims, None, None).unwrap(),
+        &pasetors::public::sign(&sk, &claims, None, &ImplicitAssertion::Unbound).unwrap(),
     )
     .unwrap();
     if let Ok(trusted_token) =
-        pasetors::public::verify(&pk, &public_token, &validation_rules, None, None)
+        pasetors::public::verify(&pk, &public_token, &validation_rules, None, &ImplicitAssertion::Unbound)
     {
         assert_eq!(&claims, trusted_token.payload_claims().unwrap());
     } else {
@@ -189,11 +189,11 @@ fn fuzz_highlevel(data: &[u8], csprng: &mut ChaCha20Rng) {
     }
 
     let local_token = UntrustedToken::<Local, V4>::try_from(
-        &pasetors::local::encrypt(&sk_local, &claims, None, None).unwrap(),
+        &pasetors::local::encrypt(&sk_local, &claims, None, &ImplicitAssertion::Unbound).unwrap(),
     )
     .unwrap();
     if let Ok(trusted_token) =
-        pasetors::local::decrypt(&sk_local, &local_token, &validation_rules, None, None)
+        pasetors::local::decrypt(&sk_local, &local_token, &validation_rules, None, &ImplicitAssertion::Unbound)
     {
         assert_eq!(&claims, trusted_token.payload_claims().unwrap());
     } else {
